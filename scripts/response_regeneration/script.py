@@ -9,6 +9,7 @@ import re
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -66,6 +67,17 @@ def parse_args():
         type=_dataset_choice,
         choices=REGEN_DATASETS,
         help="Dataset to process",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        nargs="+",
+        default=None,
+        help=(
+            "Local .parquet, .json, or .jsonl files/directories to load instead "
+            "of the Hugging Face dataset configured by --dataset. Directories "
+            "are searched recursively. All resolved files must use the same "
+            "format."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -146,6 +158,89 @@ def sanitize_filename(name: str) -> str:
     return name.strip("._")
 
 
+def resolve_dataset_files(dataset_paths: list[str]) -> tuple[str, list[str]]:
+    """Resolve local dataset files and infer the Hugging Face loader format.
+
+    Each input may be a file or directory. Directories are searched
+    recursively. Files are de-duplicated and sorted to make ``--limit`` and
+    ``--resume`` deterministic across runs.
+
+    Returns:
+        A ``(format, files)`` tuple, where format is ``"parquet"`` or
+        ``"json"`` and files contains absolute paths.
+    """
+    resolved: set[Path] = set()
+    supported_suffixes = {".parquet", ".json", ".jsonl"}
+
+    for raw_path in dataset_paths:
+        path = Path(raw_path).expanduser()
+        if path.is_file():
+            if path.suffix.lower() not in supported_suffixes:
+                raise ValueError(
+                    f"Unsupported local dataset file: {path}. Expected one of "
+                    ".parquet, .json, or .jsonl."
+                )
+            resolved.add(path.resolve())
+            continue
+
+        if path.is_dir():
+            resolved.update(
+                child.resolve()
+                for child in path.rglob("*")
+                if child.is_file() and child.suffix.lower() in supported_suffixes
+            )
+            continue
+
+        raise FileNotFoundError(f"Local dataset path does not exist: {path}")
+
+    files = sorted(resolved, key=str)
+    if not files:
+        raise ValueError(
+            "No .parquet, .json, or .jsonl files were found in --dataset-path"
+        )
+
+    suffixes = {path.suffix.lower() for path in files}
+    if suffixes == {".parquet"}:
+        dataset_format = "parquet"
+    elif suffixes <= {".json", ".jsonl"}:
+        dataset_format = "json"
+    else:
+        raise ValueError(
+            "Do not mix Parquet and JSON inputs in one --dataset-path; found "
+            f"suffixes: {sorted(suffixes)}"
+        )
+
+    return dataset_format, [str(path) for path in files]
+
+
+def load_input_dataset(
+    dataset_paths: list[str] | None,
+    *,
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+) -> tuple[Any, str, str, list[str] | None]:
+    """Load either local data files or the configured Hugging Face dataset.
+
+    Returns ``(dataset, source_label, effective_split, local_files)``. Generic
+    local file builders always expose their input as a synthetic ``train``
+    split, while remote datasets retain their configured subset and split.
+    """
+    if dataset_paths:
+        dataset_format, data_files = resolve_dataset_files(dataset_paths)
+        dataset = load_dataset(
+            dataset_format,
+            data_files=data_files,
+            split="train",
+            streaming=True,
+        )
+        source_label = f"local {dataset_format} ({len(data_files)} file(s))"
+        return dataset, source_label, "train", data_files
+
+    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
+    return dataset, dataset_id, split, None
+
+
 # ---------------------------------------------------------------------------
 # Row ingestion: user/system turns, tool schema, cached tool results
 # ---------------------------------------------------------------------------
@@ -161,14 +256,16 @@ def _conversation_messages(row: dict[str, Any]) -> list:
 
 def _message_role_content(m: dict) -> tuple[str | None, Any]:
     """Canonical ``(role, content)`` for a message across the role/content and
-    from/value schemas. ``role`` collapses ``human`` to ``user``; ``system`` and
-    ``tool`` pass through; anything else (assistant/gpt) returns ``None``."""
+    from/value schemas. ``role`` collapses ``human`` to ``user`` and ``gpt`` to
+    ``assistant``; ``system`` and ``tool`` pass through."""
     role = m.get("role") or m.get("from")
     content = m.get("content")
     if content is None:
         content = m.get("value")
     if role in ("user", "human"):
         return "user", content
+    if role in ("assistant", "gpt"):
+        return "assistant", content
     if role in ("system", "tool"):
         return role, content
     return None, content
@@ -180,8 +277,10 @@ def extract_conversation(
     """Read the regeneration turns and the cached tool results in one pass.
 
     Walks a ``messages``/``conversations`` field (role/content or from/value
-    schema). System and user turns drive regeneration; the original assistant
-    turns are dropped and regenerated. Each tool-result turn is captured as a
+    schema). System and user turns drive regeneration. The original assistant
+    response following each user turn is retained only as history for later
+    user turns; the current turn is still regenerated. Each tool-result turn is
+    captured as a
     ``(content, tool_names)`` pair, where ``tool_names`` are the tools that
     result answers (read from its ``<tool_response>`` payload) -- used to guard
     the positional splice against a call for a different tool. Rows without a
@@ -190,15 +289,22 @@ def extract_conversation(
     """
     turns: list[dict[str, Any]] = []
     results: list[tuple[Any, list[str]]] = []
+    current_user_turn: dict[str, Any] | None = None
     for m in _conversation_messages(row):
         if not isinstance(m, dict):
             continue
         role, content = _message_role_content(m)
         if role in ("system", "user") and content:
-            turns.append({"role": role, "content": content})
+            turn = {"role": role, "content": content}
+            turns.append(turn)
+            current_user_turn = turn if role == "user" else None
+        elif role == "assistant" and content is not None and current_user_turn:
+            # If a tool-using source turn contains both an assistant tool call
+            # and a final assistant answer, the last textual answer is the one
+            # that should represent this completed turn in later history.
+            current_user_turn["original_assistant"] = content
         elif role == "tool" and content is not None:
             results.append((content, _tool_result_names(content)))
-        # original assistant/gpt turns are dropped and regenerated
     if any(turn["role"] == "user" for turn in turns):
         return turns, results
 
@@ -513,7 +619,10 @@ async def regenerate_conversation(
     Each target generation -- a tool call *or* a final answer -- is one boundary
     row (loss_mask 0 over the prompt, 1 over the generated tokens). Tool calls
     are not executed: the target's i-th regenerated call is paired with the i-th
-    cached result from the source row.
+    cached result from the source row. After a user turn is regenerated, its
+    generated trajectory is replaced by that turn's original assistant response
+    before the next user turn is requested. Thus every target is regenerated
+    against the source conversation history rather than earlier regenerated text.
 
     Returns whether the conversation was truncated -- which happens when a call
     cannot be paired 1:1 with a cached result (results exhausted, a parallel
@@ -535,6 +644,7 @@ async def regenerate_conversation(
             continue
 
         prefix.append({"role": "user", "content": turn["content"]})
+        turn_prefix_len = len(prefix)
 
         # Tool-call loop: a tool call splices a cached result and continues;
         # a final answer ends the turn.
@@ -590,6 +700,14 @@ async def regenerate_conversation(
 
         if truncated:
             break
+
+        original_assistant = turn.get("original_assistant")
+        if original_assistant is not None:
+            # Keep the user message but discard this turn's regenerated
+            # assistant/tool trajectory from the history seen by later turns.
+            prefix[turn_prefix_len:] = [
+                {"role": "assistant", "content": original_assistant}
+            ]
 
     return truncated
 
@@ -739,15 +857,24 @@ async def main():
     base, ext = os.path.splitext(args.outfile)
     error_outfile = f"{base}.errors{ext or '.jsonl'}"
 
-    print(f"Using dataset: {dataset_id}")
-    print(f"Split: {split}")
+    dataset, dataset_source, effective_split, data_files = load_input_dataset(
+        args.dataset_path,
+        dataset_id=dataset_id,
+        subset=subset,
+        split=split,
+    )
+
+    print(f"Using dataset: {dataset_source}")
+    if data_files is not None:
+        for data_file in data_files:
+            print(f"  - {data_file}")
+    print(f"Split: {effective_split}")
     print(f"Prompt field: {dataset_config.prompt_field}")
     print(f"Output file: {args.outfile}")
     print(f"Error file: {error_outfile}")
     print()
 
     seen_ids = load_seen(args.outfile) if args.resume else set()
-    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
 

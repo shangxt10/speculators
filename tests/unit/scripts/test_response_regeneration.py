@@ -105,32 +105,44 @@ _EXTRACT_CASES = [
         _ULTRACHAT_ROW,
         "prompt",
         [
-            {"role": "user", "content": "Tell me about photosynthesis."},
-            {"role": "user", "content": "Now summarize it in one line."},
+            {
+                "role": "user",
+                "content": "Tell me about photosynthesis.",
+                "original_assistant": "<original answer to drop>",
+            },
+            {
+                "role": "user",
+                "content": "Now summarize it in one line.",
+                "original_assistant": "<original answer to drop>",
+            },
         ],
-        id="ultrachat_messages_multiturn_drops_assistant",
+        id="ultrachat_messages_multiturn_retains_assistant_as_history",
     ),
     pytest.param(
         _SYSTEM_PROMPTED_ROW,
         "prompt",
         [
             {"role": "system", "content": "You are a terse assistant."},
-            {"role": "user", "content": "Hi"},
+            {
+                "role": "user",
+                "content": "Hi",
+                "original_assistant": "<original answer to drop>",
+            },
         ],
         id="system_prompt_preserved",
     ),
     pytest.param(
         _MAGPIE_ROW,
         "instruction",
-        [{"role": "user", "content": "Solve 2+2."}],
+        [{"role": "user", "content": "Solve 2+2.", "original_assistant": "4"}],
         id="magpie_uses_conversations_not_instruction",
     ),
     pytest.param(
         _OPEN_PERFECTBLEND_ROW,
         "missing_field",
         [
-            {"role": "user", "content": "h1"},
-            {"role": "user", "content": "h2"},
+            {"role": "user", "content": "h1", "original_assistant": "g1"},
+            {"role": "user", "content": "h2", "original_assistant": "g2"},
         ],
         id="open_perfectblend_from_value_multiturn",
     ),
@@ -451,7 +463,11 @@ _TWO_TURN_ITEM = {
     "idx": 41,
     "primary_id": "conv-abc",
     "turns": [
-        {"role": "user", "content": "2+2?"},
+        {
+            "role": "user",
+            "content": "2+2?",
+            "original_assistant": "original four",
+        },
         {"role": "user", "content": "3+3?"},
     ],
 }
@@ -527,6 +543,12 @@ def test_worker_row_identity_and_all_or_nothing_writes(tmp_path):
     # The boundary is the mask: prompt 0s then completion 1s.
     assert rows[0]["input_ids"] == [1, 2, 3, 4]
     assert rows[0]["loss_mask"] == [0, 0, 1, 1]
+    assert rows[1]["conversations"] == [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "original four"},
+        {"role": "user", "content": "3+3?"},
+        {"role": "assistant", "content": "six"},
+    ]
     assert regen.load_seen(str(out_path)) == {"conv-abc"}
 
     # Turn 2 fails: turn 1's sample is discarded rather than half-written, which
@@ -682,7 +704,11 @@ def test_extract_conversation_pairs_hermes_results_with_tool_names():
     turns, results = regen.extract_conversation(row, None)
     assert turns == [
         {"role": "system", "content": "sys"},
-        {"role": "user", "content": "weather?"},
+        {
+            "role": "user",
+            "content": "weather?",
+            "original_assistant": "It is 15C.",
+        },
     ]
     assert len(results) == 1
     content, names = results[0]
@@ -858,7 +884,13 @@ def test_prepare_row_normalizes_like_off_policy():
         "output": "<original answer to drop>",
     }
     _, turns, _ = regen.prepare_row(row, DATASET_CONFIGS["nemotron"])
-    assert turns == [{"role": "user", "content": "Hi"}]
+    assert turns == [
+        {
+            "role": "user",
+            "content": "Hi",
+            "original_assistant": "<original answer to drop>",
+        }
+    ]
 
 
 def test_prepare_row_applies_filter_fn():
@@ -918,3 +950,122 @@ def test_tools_and_results_are_read_from_the_normalized_row():
     assert tool_results == [("sunny", [])]
     # the raw row hides the conversation behind `input`: results would be lost
     assert regen.extract_conversation(row, None)[1] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Local dataset paths resolve deterministically and use HF file builders.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_dataset_files_recurses_deduplicates_and_sorts(tmp_path):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    first = tmp_path / "a.json"
+    second = nested / "b.jsonl"
+    ignored = nested / "notes.txt"
+    first.write_text("[]", encoding="utf-8")
+    second.write_text('{"messages": []}\n', encoding="utf-8")
+    ignored.write_text("ignored", encoding="utf-8")
+
+    dataset_format, files = regen.resolve_dataset_files(
+        [str(tmp_path), str(second)]
+    )
+
+    assert dataset_format == "json"
+    assert files == sorted([str(first.resolve()), str(second.resolve())])
+
+
+def test_resolve_dataset_files_accepts_parquet(tmp_path):
+    parquet = tmp_path / "rows.parquet"
+    parquet.write_bytes(b"")
+
+    dataset_format, files = regen.resolve_dataset_files([str(parquet)])
+
+    assert dataset_format == "parquet"
+    assert files == [str(parquet.resolve())]
+
+
+def test_resolve_dataset_files_rejects_mixed_formats(tmp_path):
+    json_file = tmp_path / "rows.jsonl"
+    parquet_file = tmp_path / "rows.parquet"
+    json_file.write_text("", encoding="utf-8")
+    parquet_file.write_bytes(b"")
+
+    with pytest.raises(ValueError, match="Do not mix Parquet and JSON"):
+        regen.resolve_dataset_files([str(tmp_path)])
+
+
+def test_resolve_dataset_files_rejects_missing_empty_and_unsupported(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    unsupported = tmp_path / "rows.csv"
+    unsupported.write_text("a,b\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        regen.resolve_dataset_files([str(tmp_path / "missing.jsonl")])
+    with pytest.raises(ValueError, match="No .parquet, .json, or .jsonl"):
+        regen.resolve_dataset_files([str(empty)])
+    with pytest.raises(ValueError, match="Unsupported local dataset file"):
+        regen.resolve_dataset_files([str(unsupported)])
+
+
+def test_load_input_dataset_uses_local_json_builder(tmp_path, monkeypatch):
+    jsonl = tmp_path / "rows.jsonl"
+    jsonl.write_text('{"messages": []}\n', encoding="utf-8")
+    calls = []
+    sentinel = object()
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(regen, "load_dataset", fake_load_dataset)
+    dataset, source, split, files = regen.load_input_dataset(
+        [str(jsonl)],
+        dataset_id="unused/remote",
+        subset="unused-subset",
+        split="validation",
+    )
+
+    assert dataset is sentinel
+    assert source == "local json (1 file(s))"
+    assert split == "train"
+    assert files == [str(jsonl.resolve())]
+    assert calls == [
+        (
+            ("json",),
+            {
+                "data_files": [str(jsonl.resolve())],
+                "split": "train",
+                "streaming": True,
+            },
+        )
+    ]
+
+
+def test_load_input_dataset_preserves_remote_dataset_arguments(monkeypatch):
+    calls = []
+    sentinel = object()
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(regen, "load_dataset", fake_load_dataset)
+    dataset, source, split, files = regen.load_input_dataset(
+        None,
+        dataset_id="org/data",
+        subset="config",
+        split="validation",
+    )
+
+    assert dataset is sentinel
+    assert source == "org/data"
+    assert split == "validation"
+    assert files is None
+    assert calls == [
+        (
+            ("org/data",),
+            {"name": "config", "split": "validation", "streaming": True},
+        )
+    ]
