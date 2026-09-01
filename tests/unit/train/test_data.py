@@ -2,14 +2,18 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from datasets import Dataset
 from safetensors.torch import save_file
 
+from hs_connectors import FileTransfer
 from speculators.models.eagle3.data import shift_batch
 from speculators.train.data import (
     ArrowDataset,
+    HS_PROFILE_KEY,
+    HS_PROFILE_ONLY_KEY,
     SampleFileDataset,
     create_collate_fn,
     standardize_data_v1,
@@ -527,3 +531,93 @@ def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Pat
     assert arrow_ds.transfer.hidden_states_path.is_dir()
     # And the cached file should exist
     assert (arrow_ds.transfer.hidden_states_path / "hs_0.safetensors").exists()
+
+
+def test_arrow_pipeline_profile_reaches_collated_batch(tmp_path: Path):
+    data_path = tmp_path / "data"
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.save_to_disk(str(data_path))
+    hidden_states_path = data_path / "hidden_states"
+    hidden_states_path.mkdir()
+    save_file(
+        {
+            "token_ids": torch.tensor([1, 2, 3]),
+            "hidden_states": torch.zeros(3, 2, 2),
+        },
+        hidden_states_path / "hs_0.safetensors",
+    )
+
+    arrow_ds = ArrowDataset(
+        max_len=8,
+        datapath=str(data_path),
+        on_missing="raise",
+        profile_pipeline=True,
+    )
+    arrow_ds.data.set_format(type="torch")
+    sample = arrow_ds[0]
+
+    assert sample is not None
+    assert sample[HS_PROFILE_KEY]["source"] == "cache"
+    assert sample[HS_PROFILE_KEY]["cache_file_bytes"] > 0
+    assert "cache_file_load_ms" in sample[HS_PROFILE_KEY]
+
+    batch = create_collate_fn(max_len=8, hidden_size=2, num_target_layers=1)(
+        [sample]
+    )
+    assert len(batch[HS_PROFILE_KEY]) == 1
+    assert batch[HS_PROFILE_KEY][0]["sample_index"] == 0
+    assert "raw_data_total_ms" in batch[HS_PROFILE_KEY][0]
+    assert "transform_ms" in batch[HS_PROFILE_KEY][0]
+    assert "preprocess_ms" in batch[HS_PROFILE_KEY][0]
+    assert "collate_ms" in batch[HS_PROFILE_KEY][0]
+
+
+def test_file_transfer_profiling_is_opt_in(tmp_path: Path):
+    transfer = FileTransfer(tmp_path)
+
+    with patch("hs_connectors.transfer._load_hs_file", return_value=None) as load:
+        transfer.get_cached(0)
+        assert len(load.call_args.args) == 1
+
+        transfer.set_profile_enabled(True)
+        transfer.get_cached(1)
+        assert len(load.call_args.args) == 2
+        assert isinstance(load.call_args.args[1], dict)
+
+
+def test_dropped_arrow_sample_keeps_profile_through_collate(tmp_path: Path):
+    data_path = tmp_path / "data"
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.save_to_disk(str(data_path))
+
+    arrow_ds = ArrowDataset(
+        max_len=8,
+        datapath=str(data_path),
+        on_missing="skip",
+        profile_pipeline=True,
+    )
+    sample = arrow_ds[0]
+
+    assert sample is not None
+    assert sample[HS_PROFILE_ONLY_KEY] is True
+    assert sample[HS_PROFILE_KEY]["sample_status"] == "dropped"
+    assert "item_total_ms" in sample[HS_PROFILE_KEY]
+
+    batch = create_collate_fn(max_len=8, hidden_size=2, num_target_layers=1)(
+        [sample]
+    )
+    assert len(batch[HS_PROFILE_KEY]) == 1
+    assert batch[HS_PROFILE_KEY][0]["sample_status"] == "dropped"
+    assert torch.all(batch["document_ids"] == -1)

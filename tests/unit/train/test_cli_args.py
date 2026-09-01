@@ -15,6 +15,26 @@ def _parse(monkeypatch, extra: list[str]):
     return parse_args()
 
 
+def test_pipeline_profile_sync_is_separately_opt_in(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.profile_pipeline is False
+    assert args.profile_sync_ranks is False
+    assert args.profile_summary_freq == 10
+
+    args = _parse(
+        monkeypatch,
+        [
+            "--profile-pipeline",
+            "--profile-sync-ranks",
+            "--profile-summary-freq",
+            "0",
+        ],
+    )
+    assert args.profile_pipeline is True
+    assert args.profile_sync_ranks is True
+    assert args.profile_summary_freq == 0
+
+
 # ---------------------------------------------------------------------------
 # Ensure CLI args flow correctly through vars(args) into get_trainer_kwargs
 # ---------------------------------------------------------------------------

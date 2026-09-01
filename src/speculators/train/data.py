@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import time
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -11,7 +12,7 @@ from typing import Any, Literal, cast
 import openai
 import torch
 from datasets import load_from_disk
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
 from speculators.data_generation.offline import check_hidden_states
@@ -24,6 +25,8 @@ from speculators.data_generation.vllm_client import (
 from speculators.train.noise_transforms import TransformTensors
 
 BatchType = dict[str, Any]
+HS_PROFILE_KEY = "__hs_profile__"
+HS_PROFILE_ONLY_KEY = "__hs_profile_only__"
 
 
 def list_files(path):
@@ -163,7 +166,13 @@ class BaseDataset(Dataset):
         raise NotImplementedError
 
     def __getitem__(self, index) -> BatchType | None:
+        profile = getattr(self, "_active_profile", None)
+        raw_started = time.perf_counter() if profile is not None else 0.0
         data = self._get_raw_data(index)
+        if profile is not None:
+            profile["raw_data_total_ms"] = (
+                time.perf_counter() - raw_started
+            ) * 1000
 
         if data is None:
             return data
@@ -175,6 +184,7 @@ class BaseDataset(Dataset):
         #  "loss_mask": [seq_len],
         # }
 
+        metadata_started = time.perf_counter() if profile is not None else 0.0
         # Add lengths tensor
         seq_len = data["input_ids"].shape[0]
         data["lengths"] = torch.tensor([seq_len], dtype=torch.long)
@@ -192,9 +202,24 @@ class BaseDataset(Dataset):
         #     "position_ids": [seq_len],
         # }
 
-        # Apply transform
+        if profile is not None:
+            profile["sample_metadata_ms"] = (
+                time.perf_counter() - metadata_started
+            ) * 1000
+
+        # Apply transform. For mmap-backed safetensors this may be where file
+        # pages are first touched, so report it separately from load_file().
         if self.transform:
-            data = self.transform(data)
+            transform_started = time.perf_counter() if profile is not None else 0.0
+            try:
+                data = self.transform(data)
+            finally:
+                if profile is not None:
+                    profile["transform_ms"] = (
+                        time.perf_counter() - transform_started
+                    ) * 1000
+        elif profile is not None:
+            profile["transform_ms"] = 0.0
 
         return data
 
@@ -214,6 +239,7 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        profile_pipeline: bool = False,
     ):
         self.data = load_from_disk(datapath)
         self.start_file_idx = 0
@@ -238,12 +264,64 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.profile_pipeline = profile_pipeline
+        self._active_profile: dict[str, Any] | None = None
+        self._profile_item_count = 0
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
 
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
+
+    def __getitem__(self, index) -> BatchType | None:
+        if not self.profile_pipeline:
+            self.transfer.set_profile_enabled(False)
+            return super().__getitem__(index)
+
+        worker = get_worker_info()
+        self._profile_item_count += 1
+        profile: dict[str, Any] = {
+            "rank": int(os.environ.get("RANK", "0")),
+            "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            "worker_id": worker.id if worker is not None else -1,
+            "worker_pid": os.getpid(),
+            "worker_task_seq": self._profile_item_count,
+            "sample_index": int(index),
+            "file_index": int(self._map_to_file_idx(index)),
+            "vllm_endpoint": self.vllm_endpoint,
+        }
+        self._active_profile = profile
+        self.transfer.set_profile_enabled(True)
+        started = time.perf_counter()
+        try:
+            result = super().__getitem__(index)
+            profile["item_total_ms"] = (time.perf_counter() - started) * 1000
+            if result is None:
+                # Preserve timing for failed/skipped samples without letting the
+                # profile-only record enter preprocessing or model tensors.
+                profile["sample_status"] = "dropped"
+                return {
+                    HS_PROFILE_KEY: profile,
+                    HS_PROFILE_ONLY_KEY: True,
+                }
+            profile["sample_status"] = "ok"
+            result[HS_PROFILE_KEY] = profile
+            return result
+        except Exception as error:
+            profile["item_total_ms"] = (time.perf_counter() - started) * 1000
+            profile["error"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            self._active_profile = None
+
+    def _record_transfer_profile(self, prefix: str) -> None:
+        if self._active_profile is None:
+            return
+        details = self.transfer.consume_profile()
+        self._active_profile.update(
+            {f"{prefix}_{key}": value for key, value in details.items()}
+        )
 
     def _setup_client(self):
         self.client = openai.OpenAI(
@@ -268,38 +346,96 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
+        profile = self._active_profile
+        client_reused = self.client is not None
+        if profile is not None:
+            profile["client_reused"] = client_reused
         if not self.client:
-            self._setup_client()
+            setup_started = time.perf_counter() if profile is not None else 0.0
+            try:
+                self._setup_client()
+            finally:
+                if profile is not None:
+                    profile["client_setup_ms"] = (
+                        time.perf_counter() - setup_started
+                    ) * 1000
 
+        dataset_started = time.perf_counter() if profile is not None else 0.0
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
-
-        try:
-            handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
+        if profile is not None:
+            profile["dataset_payload_ms"] = (
+                time.perf_counter() - dataset_started
+            ) * 1000
+            profile["seq_len"] = len(client_item["input_ids"])
+            profile["request_api"] = (
+                "chat" if client_item.get("messages") is not None else "completions"
             )
 
-            loaded_hs = self.transfer.get_generated(handle)
+        try:
+            request_started = time.perf_counter() if profile is not None else 0.0
+            try:
+                handle = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
+            finally:
+                if profile is not None:
+                    profile["vllm_request_ms"] = (
+                        time.perf_counter() - request_started
+                    ) * 1000
+
+            if profile is not None:
+                profile["handle"] = str(handle)
+
+            generated_read_started = (
+                time.perf_counter() if profile is not None else 0.0
+            )
+            try:
+                loaded_hs = self.transfer.get_generated(handle)
+            finally:
+                if profile is not None:
+                    profile["generated_read_ms"] = (
+                        time.perf_counter() - generated_read_started
+                    ) * 1000
+                self._record_transfer_profile("generated")
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            check_started = time.perf_counter() if profile is not None else 0.0
+            try:
+                check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            finally:
+                if profile is not None:
+                    profile["hidden_states_check_ms"] = (
+                        time.perf_counter() - check_started
+                    ) * 1000
 
             file_idx = self._map_to_file_idx(index)
-            match self.on_generate:
-                case "cache":
-                    self.transfer.cache(handle, file_idx)
-                case "delete":
-                    self.transfer.delete(handle)
+            cleanup_started = time.perf_counter() if profile is not None else 0.0
+            try:
+                match self.on_generate:
+                    case "cache":
+                        self.transfer.cache(handle, file_idx)
+                    case "delete":
+                        self.transfer.delete(handle)
+            finally:
+                if profile is not None:
+                    profile["cleanup_ms"] = (
+                        time.perf_counter() - cleanup_started
+                    ) * 1000
+                    profile["cleanup_action"] = self.on_generate
         except Exception as e:
+            if profile is not None:
+                profile["error"] = f"{type(e).__name__}: {e}"
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
             warnings.warn(
-                f"Failed to load/cache hidden states for sample {index}: {e}",
+                f"Failed to load/cache hidden states for sample {index}: {e}. "
+                f"profile={profile if profile is not None else 'disabled'}",
                 stacklevel=1,
             )
             return None
@@ -307,10 +443,21 @@ class ArrowDataset(BaseDataset):
         return loaded_hs
 
     def _get_raw_data(self, index):
+        profile = self._active_profile
         file_idx = self._map_to_file_idx(index)
-        loaded_hs = self.transfer.get_cached(file_idx)
+        cache_started = time.perf_counter() if profile is not None else 0.0
+        try:
+            loaded_hs = self.transfer.get_cached(file_idx)
+        finally:
+            if profile is not None:
+                profile["cache_lookup_ms"] = (
+                    time.perf_counter() - cache_started
+                ) * 1000
+            self._record_transfer_profile("cache")
 
         if loaded_hs is None:
+            if profile is not None:
+                profile["source"] = "generated"
             match self.on_missing:
                 case "generate":
                     loaded_hs = self._maybe_generate_hs(index)
@@ -326,16 +473,29 @@ class ArrowDataset(BaseDataset):
                     raise RuntimeError(
                         f"Failed to load hidden states for sample {index}."
                     )
+        elif profile is not None:
+            profile["source"] = "cache"
 
         if loaded_hs is None:
             return loaded_hs
+
+        if profile is not None:
+            profile["seq_len"] = int(loaded_hs["token_ids"].numel())
 
         # loaded_hs structure: {
         #   "hidden_states": [seq_len, num_layers, hidden_size]
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        token_check_started = time.perf_counter() if profile is not None else 0.0
+        token_ids_match = torch.equal(
+            loaded_hs["token_ids"], self.data[index]["input_ids"]
+        )
+        if profile is not None:
+            profile["token_check_ms"] = (
+                time.perf_counter() - token_check_started
+            ) * 1000
+        if not token_ids_match:
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
                 f"match input ids {self.data[index]['input_ids']}",
@@ -343,16 +503,23 @@ class ArrowDataset(BaseDataset):
             )
             return None
 
-        return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
-                1
-            ),  # [seq_len, 3 * hidden_size]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
-            "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
-            ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
-        }
+        tensor_prepare_started = time.perf_counter() if profile is not None else 0.0
+        try:
+            return {
+                "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+                    1
+                ),  # [seq_len, 3 * hidden_size]
+                "input_ids": loaded_hs["token_ids"],  # [seq_len]
+                "verifier_last_hidden_states": loaded_hs["hidden_states"][
+                    :, -1
+                ],  # [seq_len, hidden_size]
+                "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            }
+        finally:
+            if profile is not None:
+                profile["tensor_prepare_ms"] = (
+                    time.perf_counter() - tensor_prepare_started
+                ) * 1000
 
 
 class SampleFileDataset(BaseDataset):
@@ -461,7 +628,25 @@ def create_collate_fn(
 ):
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
         # Apply per-sample preprocessing and filter failed samples
-        batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
+        profiles: list[dict[str, Any]] = []
+        data_batch: list[BatchType] = []
+        for sample in batch:
+            if sample is None:
+                continue
+            profile = sample.pop(HS_PROFILE_KEY, None)
+            if profile is not None:
+                profiles.append(profile)
+            if sample.pop(HS_PROFILE_ONLY_KEY, False):
+                continue
+            preprocess_started = time.perf_counter() if profile is not None else 0.0
+            processed = preprocess(sample) if preprocess else sample
+            if profile is not None:
+                profile["preprocess_ms"] = (
+                    time.perf_counter() - preprocess_started
+                ) * 1000
+            data_batch.append(processed)
+        batch = data_batch
+        collate_started = time.perf_counter() if profiles else 0.0
 
         if not batch:
             # Create empty sample which then gets padded to full
@@ -522,6 +707,13 @@ def create_collate_fn(
         ).unsqueeze(0)
         # shape: [1, max_len]
         collated_data["document_ids"] = document_ids
+        if profiles:
+            collate_finished = time.perf_counter()
+            collate_ms = (collate_finished - collate_started) * 1000
+            for profile in profiles:
+                profile["collate_ms"] = collate_ms
+                profile["collate_finished_perf"] = collate_finished
+            collated_data[HS_PROFILE_KEY] = profiles
 
         return collated_data
 

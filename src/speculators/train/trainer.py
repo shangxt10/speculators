@@ -26,6 +26,7 @@ from speculators.train.checkpointer import (
     DistributedCheckpointer,
     SingleGPUCheckpointer,
 )
+from speculators.train.data import HS_PROFILE_KEY
 from speculators.train.distributed import (
     apply_fully_sharded,
     get_local_rank,
@@ -92,15 +93,29 @@ class _StepTimer:
         if any(name not in m for name in self._PROFILE_MARKS):
             return None
         has_start = "start" in m
-        fwd_ms = (m["fwd"] - m["fetch"]) * 1000
+        has_data_ready = "data_ready" in m
+        fwd_started = m.get("pre_fwd", m["fetch"])
+        pre_fwd_sync_ms = (fwd_started - m["fetch"]) * 1000
+        fwd_ms = (m["fwd"] - fwd_started) * 1000
         bwd_ms = (m["bwd"] - m["fwd"]) * 1000
         opt_ms = (m["opt"] - m["bwd"]) * 1000
         fetch_ms = (m["fetch"] - m["start"]) * 1000 if has_start else 0.0
+        loader_wait_ms = (
+            (m["data_ready"] - m["start"]) * 1000
+            if has_start and has_data_ready
+            else fetch_ms
+        )
+        h2d_ms = (
+            (m["fetch"] - m["data_ready"]) * 1000 if has_data_ready else 0.0
+        )
         step_ms = (m["opt"] - m["start"]) * 1000 if has_start else 0.0
         tokens_per_s = num_tokens / (step_ms / 1000) if step_ms > 0 else 0.0
         fetch_frac = fetch_ms / step_ms if step_ms > 0 else 0.0
         return {
+            "loader_wait_ms": loader_wait_ms,
+            "h2d_ms": h2d_ms,
             "fetch_ms": fetch_ms,
+            "pre_fwd_sync_ms": pre_fwd_sync_ms,
             "fwd_ms": fwd_ms,
             "bwd_ms": bwd_ms,
             "opt_ms": opt_ms,
@@ -138,6 +153,9 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    profile_pipeline: bool = False
+    profile_sync_ranks: bool = False
+    profile_summary_freq: int = 10
 
 
 def _resolve_scheduler_steps(
@@ -436,6 +454,260 @@ class Trainer:
             )
         return skip_steps
 
+    @staticmethod
+    def _format_worker_profile(step: int, worker: dict) -> str:
+        identity = (
+            f"step={step} rank={worker.get('rank', '?')} "
+            f"local_rank={worker.get('local_rank', '?')} "
+            f"worker={worker.get('worker_id', '?')} "
+            f"pid={worker.get('worker_pid', '?')} "
+            f"worker_task={worker.get('worker_task_seq', '?')} "
+            f"sample={worker.get('sample_index', '?')} "
+            f"seq_len={worker.get('seq_len', '?')} "
+            f"source={worker.get('source', '?')}"
+        )
+        timing_keys = (
+            "item_total_ms",
+            "client_setup_ms",
+            "dataset_payload_ms",
+            "cache_lookup_ms",
+            "cache_lock_check_ms",
+            "cache_lock_wait_ms",
+            "cache_exists_check_ms",
+            "cache_stat_ms",
+            "cache_file_load_ms",
+            "cache_total_ms",
+            "vllm_request_ms",
+            "generated_read_ms",
+            "generated_lock_check_ms",
+            "generated_lock_wait_ms",
+            "generated_exists_check_ms",
+            "generated_stat_ms",
+            "generated_file_load_ms",
+            "generated_total_ms",
+            "hidden_states_check_ms",
+            "token_check_ms",
+            "tensor_prepare_ms",
+            "raw_data_total_ms",
+            "sample_metadata_ms",
+            "transform_ms",
+            "preprocess_ms",
+            "collate_ms",
+            "collate_to_consume_ms",
+            "cleanup_ms",
+        )
+        timings = " ".join(
+            f"{key}={float(worker[key]):.2f}"
+            for key in timing_keys
+            if key in worker
+        )
+        details: list[str] = []
+        for key in (
+            "request_api",
+            "client_reused",
+            "vllm_endpoint",
+            "cache_lock_present",
+            "cache_file_bytes",
+            "cache_path",
+            "generated_lock_present",
+            "generated_file_bytes",
+            "cleanup_action",
+            "sample_status",
+            "handle",
+            "error",
+        ):
+            if key in worker:
+                details.append(f"{key}={worker[key]}")
+        return f"[PIPELINE-WORKER] {identity} {timings} {' '.join(details)}"
+
+    def _log_pipeline_profile(
+        self,
+        *,
+        profile: dict[str, float],
+        worker_profiles: list[dict],
+        num_tokens: int,
+    ) -> None:
+        # Print details on the rank that produced them. The rank-0 filter is
+        # explicitly overridden so rank 0 does not become a serial logging hub.
+        log_extra = {"override_rank0_filter": True}
+        rank_line = (
+            "[PIPELINE-RANK] step=%d sync_ranks=%s rank=%d local_rank=%d "
+            "tokens=%d loader_wait_ms=%.2f h2d_ms=%.2f "
+            "pre_forward_sync_ms=%.2f forward_ms=%.2f backward_ms=%.2f "
+            "optimizer_ms=%.2f step_ms=%.2f worker_samples=%d"
+        ) % (
+            self.global_step,
+            self.config.profile_sync_ranks,
+            self.rank,
+            self.local_rank,
+            num_tokens,
+            profile["loader_wait_ms"],
+            profile["h2d_ms"],
+            profile["pre_fwd_sync_ms"],
+            profile["fwd_ms"],
+            profile["bwd_ms"],
+            profile["opt_ms"],
+            profile["step_ms"],
+            len(worker_profiles),
+        )
+        workers = sorted(
+            worker_profiles,
+            key=lambda worker: (
+                worker.get("worker_id", -1),
+                worker.get("sample_index", -1),
+            ),
+        )
+        local_lines = [rank_line]
+        local_lines.extend(
+            self._format_worker_profile(self.global_step, worker)
+            for worker in workers
+        )
+        root_logger.warning("\n".join(local_lines), extra=log_extra)
+
+        summary_freq = self.config.profile_summary_freq
+        if summary_freq == 0 or self.global_step % summary_freq != 0:
+            if self.is_distributed and self.config.profile_sync_ranks:
+                # In sync-ranks mode, do not let different local log lengths
+                # become next step's pre_forward_sync_ms.
+                dist.barrier()
+            return
+
+        # Only fixed-size numeric tensors cross HCCL. Strings and variable-size
+        # worker lists stay local to avoid all_gather_object compatibility and
+        # serialization overhead.
+        stage_keys = (
+            "loader_wait_ms",
+            "h2d_ms",
+            "pre_fwd_sync_ms",
+            "fwd_ms",
+            "bwd_ms",
+            "opt_ms",
+            "step_ms",
+        )
+        worker_keys = (
+            "item_total_ms",
+            "vllm_request_ms",
+            "cache_lookup_ms",
+            "generated_read_ms",
+            "generated_lock_wait_ms",
+            "transform_ms",
+            "collate_ms",
+        )
+        local_worker_maxima: list[dict | None] = []
+        for key in worker_keys:
+            candidates = [worker for worker in workers if key in worker]
+            local_worker_maxima.append(
+                max(candidates, key=lambda worker: float(worker[key]))
+                if candidates
+                else None
+            )
+
+        metric_values = [float(profile[key]) for key in stage_keys]
+        metric_values.extend(
+            float(worker[key]) if worker is not None else -1.0
+            for key, worker in zip(worker_keys, local_worker_maxima, strict=True)
+        )
+        identity_values = [self.rank, self.local_rank, num_tokens, len(workers)]
+        for worker in local_worker_maxima:
+            identity_values.extend(
+                [
+                    int(worker.get("worker_id", -1)) if worker is not None else -1,
+                    int(worker.get("sample_index", -1)) if worker is not None else -1,
+                ]
+            )
+
+        profile_device = next(self.model.parameters()).device
+        metric_tensor = torch.tensor(
+            metric_values,
+            dtype=torch.float32,
+            device=profile_device,
+        )
+        identity_tensor = torch.tensor(
+            identity_values,
+            dtype=torch.int64,
+            device=profile_device,
+        )
+        if self.is_distributed:
+            world_size = dist.get_world_size()
+            gathered_metrics = [
+                torch.empty_like(metric_tensor) for _ in range(world_size)
+            ]
+            gathered_identities = [
+                torch.empty_like(identity_tensor) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_metrics, metric_tensor)
+            dist.all_gather(gathered_identities, identity_tensor)
+        else:
+            gathered_metrics = [metric_tensor]
+            gathered_identities = [identity_tensor]
+
+        if self.rank == 0:
+            metric_rows = [tensor.cpu().tolist() for tensor in gathered_metrics]
+            identity_rows = [tensor.cpu().tolist() for tensor in gathered_identities]
+
+            def stage_extreme(key: str, *, minimum: bool = False) -> tuple[int, float]:
+                column = stage_keys.index(key)
+                chooser = min if minimum else max
+                row = chooser(
+                    range(len(metric_rows)),
+                    key=lambda index: metric_rows[index][column],
+                )
+                return int(identity_rows[row][0]), float(metric_rows[row][column])
+
+            def worker_extreme(key: str) -> str:
+                worker_column = worker_keys.index(key)
+                metric_column = len(stage_keys) + worker_column
+                row = max(
+                    range(len(metric_rows)),
+                    key=lambda index: metric_rows[index][metric_column],
+                )
+                value = float(metric_rows[row][metric_column])
+                if value < 0:
+                    return "none"
+                identity_column = 4 + worker_column * 2
+                return (
+                    f"rank{int(identity_rows[row][0])}/worker"
+                    f"{int(identity_rows[row][identity_column])}/sample"
+                    f"{int(identity_rows[row][identity_column + 1])}:{value:.2f}ms"
+                )
+
+            slow_loader = stage_extreme("loader_wait_ms")
+            slow_h2d = stage_extreme("h2d_ms")
+            slow_pre_fwd = stage_extreme("pre_fwd_sync_ms")
+            fast_fwd = stage_extreme("fwd_ms", minimum=True)
+            slow_fwd = stage_extreme("fwd_ms")
+            slow_bwd = stage_extreme("bwd_ms")
+            root_logger.warning(
+                "[PIPELINE-SUMMARY] step=%d sync_ranks=%s "
+                "loader_max=rank%d:%.2fms h2d_max=rank%d:%.2fms "
+                "pre_forward_sync_max=rank%d:%.2fms "
+                "forward_min=rank%d:%.2fms forward_max=rank%d:%.2fms "
+                "backward_max=rank%d:%.2fms slow_item=%s max_vllm=%s "
+                "max_cache_lookup=%s max_generated_read=%s max_file_lock=%s "
+                "max_transform=%s max_collate=%s",
+                self.global_step,
+                self.config.profile_sync_ranks,
+                *slow_loader,
+                *slow_h2d,
+                *slow_pre_fwd,
+                *fast_fwd,
+                *slow_fwd,
+                *slow_bwd,
+                worker_extreme("item_total_ms"),
+                worker_extreme("vllm_request_ms"),
+                worker_extreme("cache_lookup_ms"),
+                worker_extreme("generated_read_ms"),
+                worker_extreme("generated_lock_wait_ms"),
+                worker_extreme("transform_ms"),
+                worker_extreme("collate_ms"),
+            )
+
+        # The fixed-tensor gathers rendezvous after local detail output; this
+        # final barrier only covers rank 0's single summary line so console I/O
+        # cannot appear as another rank's next-step forward time.
+        if self.is_distributed:
+            dist.barrier()
+
     def train_epoch(self, epoch: int):
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
@@ -456,14 +728,40 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
-        t_before_fetch = time.perf_counter()
         timer = _StepTimer()
-        for local_step_rel, batch in enumerate(train_loader, 1):
+        train_iterator = iter(train_loader)
+        local_step_rel = 0
+        while True:
+            should_log_metrics = self.global_step % self.config.log_freq == 0
+            timing_enabled = should_log_metrics or self.config.profile_pipeline
+            timer.reset(timing_enabled)
+            fetch_started = time.perf_counter() if timing_enabled else 0.0
+            timer.mark_value("start", fetch_started)
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                break
+            data_ready = time.perf_counter() if timing_enabled else 0.0
+            timer.mark_value("data_ready", data_ready)
+            local_step_rel += 1
+
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
-            timer.reset(self.global_step % self.config.log_freq == 0)
-
-            timer.mark_value("start", t_before_fetch)
+            worker_profiles = batch.pop(HS_PROFILE_KEY, [])
+            for worker_profile in worker_profiles:
+                collate_finished = worker_profile.pop(
+                    "collate_finished_perf", None
+                )
+                if collate_finished is not None:
+                    # perf_counter is system-wide on the training host. This
+                    # interval is how long an already-collated batch takes to reach
+                    # consumption: queue residence, IPC/deserialization, and the
+                    # pin-memory path. A large value can mean useful prefetch lead;
+                    # loader_wait_ms remains the measure of current-step blocking.
+                    worker_profile["collate_to_consume_ms"] = max(
+                        0.0,
+                        (data_ready - float(collate_finished)) * 1000,
+                    )
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -475,6 +773,16 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 timer.mark("fetch")
+                if (
+                    self.config.profile_pipeline
+                    and self.config.profile_sync_ranks
+                    and self.is_distributed
+                ):
+                    # Make cross-rank data skew explicit. Without this diagnostic
+                    # barrier, DDP buffer/parameter synchronization can charge time
+                    # spent waiting for a data-straggler rank to "forward".
+                    dist.barrier()
+                    timer.mark("pre_fwd")
                 _draft_tokens, loss, metrics = self.model(
                     **gpu_batch, **(self.config.train_call_kwargs or {})
                 )
@@ -492,12 +800,15 @@ class Trainer:
             }
             self._schedulers_step()
             timer.mark("opt")
-            t_before_fetch = timer.now() or time.perf_counter()
 
             profile = None
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
+            else:
+                num_tokens = 0
+
+            if should_log_metrics:
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
@@ -519,6 +830,13 @@ class Trainer:
                         "global_step": self.global_step,
                     },
                     extra={"step": self.global_step},
+                )
+
+            if self.config.profile_pipeline and profile is not None:
+                self._log_pipeline_profile(
+                    profile=profile,
+                    worker_profiles=worker_profiles,
+                    num_tokens=num_tokens,
                 )
             self.global_step += 1
 
@@ -545,6 +863,10 @@ class Trainer:
         val_metrics: dict[str, float] = {}
         num_batches = len(val_loader)
         for batch in val_loader:
+            # Validation currently does not emit the detailed pipeline profile,
+            # but ArrowDataset may still attach worker metadata when diagnostics
+            # are enabled for the shared train/validation loader setup.
+            batch.pop(HS_PROFILE_KEY, None)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)

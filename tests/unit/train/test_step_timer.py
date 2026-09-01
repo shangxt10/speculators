@@ -138,3 +138,22 @@ def test_zero_step_ms_returns_zero_throughput():
     assert profile is not None
     assert profile["tokens_per_s"] == 0.0
     assert profile["fetch_frac"] == 0.0
+
+
+def test_pipeline_timer_splits_loader_h2d_sync_and_forward():
+    timer = _StepTimer(enabled=True)
+    timer.mark_value("start", 1.0)
+    timer.mark_value("data_ready", 1.2)
+    timer.mark_value("fetch", 1.3)
+    timer.mark_value("pre_fwd", 1.7)
+    timer.mark_value("fwd", 1.9)
+    timer.mark_value("bwd", 2.2)
+    timer.mark_value("opt", 2.4)
+
+    profile = timer.profile(num_tokens=1400)
+
+    assert profile is not None
+    assert profile["loader_wait_ms"] == pytest.approx(200)
+    assert profile["h2d_ms"] == pytest.approx(100)
+    assert profile["pre_fwd_sync_ms"] == pytest.approx(400)
+    assert profile["fwd_ms"] == pytest.approx(200)

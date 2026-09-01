@@ -648,6 +648,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        profile_pipeline=args.profile_pipeline,
         train_data_ratio=args.train_data_ratio,
     )
 
@@ -678,6 +679,9 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        profile_pipeline=args.profile_pipeline,
+        profile_sync_ranks=args.profile_sync_ranks,
+        profile_summary_freq=args.profile_summary_freq,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1211,6 +1215,35 @@ def parse_args():
         "--prefetch-factor", type=int, default=4, help="Dataloader prefetch factor"
     )
     parser.add_argument(
+        "--profile-pipeline",
+        action="store_true",
+        default=False,
+        help=(
+            "Print per-step timings for every training rank and dataloader worker, "
+            "including vLLM request and hidden-state file I/O. Diagnostic only: "
+            "cross-rank collection and console output reduce throughput."
+        ),
+    )
+    parser.add_argument(
+        "--profile-sync-ranks",
+        action="store_true",
+        default=False,
+        help=(
+            "With --profile-pipeline, add a barrier immediately before forward "
+            "to move cross-rank data skew into pre_forward_sync_ms. This changes "
+            "the workload timing; use only for a second diagnostic run."
+        ),
+    )
+    parser.add_argument(
+        "--profile-summary-freq",
+        type=int,
+        default=10,
+        help=(
+            "With --profile-pipeline, run the fixed-tensor cross-rank summary "
+            "every N steps (default: 10). Use 0 for local rank/worker logs only."
+        ),
+    )
+    parser.add_argument(
         "--noise-std",
         type=float,
         default=0.05,
@@ -1297,6 +1330,11 @@ def parse_args():
     )
 
     args = parser.parse_args()
+
+    if args.profile_sync_ranks and not args.profile_pipeline:
+        parser.error("--profile-sync-ranks requires --profile-pipeline")
+    if args.profile_summary_freq < 0:
+        parser.error("--profile-summary-freq must be >= 0")
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:

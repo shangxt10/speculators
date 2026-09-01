@@ -59,6 +59,18 @@ class HiddenStatesTransfer(ABC):
     def delete(self, handle: str) -> None:  # noqa: B027
         """Clean up a generated sample (e.g. delete a temp file)."""
 
+    def consume_profile(self) -> dict[str, Any]:
+        """Return and clear timing details from the most recent transfer call.
+
+        Backends that do not expose detailed timings may keep the default empty
+        result.  The method is deliberately non-abstract so third-party transfer
+        backends remain source compatible.
+        """
+        return {}
+
+    def set_profile_enabled(self, enabled: bool) -> None:  # noqa: B027
+        """Enable or disable backend timing collection."""
+
 
 class HiddenStatesBackend(ABC):
     """Plugin interface for hidden-states transfer backends.
@@ -118,14 +130,73 @@ class HiddenStatesBackend(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+def _load_hs_file(
+    file_path: Path,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, torch.Tensor] | None:
+    # Preserve the original hot path exactly when profiling is disabled.  In
+    # particular, avoid the extra stat() call because metadata operations can
+    # be expensive on shared file systems.
+    if profile is None:
+        lock_path = str(file_path) + ".lock"
+        if Path(lock_path).exists():
+            wait_for_lock(lock_path)
+        if file_path.exists():
+            return load_file(file_path)
+        return None
+
+    started = time.perf_counter()
+    profile.update(
+        {
+            "path": str(file_path),
+            "lock_present": False,
+            "lock_wait_ms": 0.0,
+            "exists_check_ms": 0.0,
+            "stat_ms": 0.0,
+            "file_load_ms": 0.0,
+            "file_bytes": 0,
+        }
+    )
+
     lock_path = str(file_path) + ".lock"
-    if Path(lock_path).exists():
-        wait_for_lock(lock_path)
+    lock_check_started = time.perf_counter()
+    lock_present = Path(lock_path).exists()
+    profile["lock_present"] = lock_present
+    profile["lock_check_ms"] = (
+        time.perf_counter() - lock_check_started
+    ) * 1000
+    if lock_present:
+        lock_wait_started = time.perf_counter()
+        try:
+            wait_for_lock(lock_path)
+        finally:
+            profile["lock_wait_ms"] = (
+                time.perf_counter() - lock_wait_started
+            ) * 1000
 
-    if file_path.exists():
-        return load_file(file_path)
+    exists_started = time.perf_counter()
+    file_exists = file_path.exists()
+    profile["exists_check_ms"] = (time.perf_counter() - exists_started) * 1000
+    profile["file_exists"] = file_exists
 
+    if file_exists:
+        stat_started = time.perf_counter()
+        try:
+            file_bytes = file_path.stat().st_size
+        finally:
+            profile["stat_ms"] = (time.perf_counter() - stat_started) * 1000
+        profile["file_bytes"] = file_bytes
+
+        load_started = time.perf_counter()
+        try:
+            return load_file(file_path)
+        finally:
+            profile["file_load_ms"] = (
+                time.perf_counter() - load_started
+            ) * 1000
+            profile["total_ms"] = (time.perf_counter() - started) * 1000
+
+    profile["total_ms"] = (time.perf_counter() - started) * 1000
     return None
 
 
@@ -134,13 +205,36 @@ class FileTransfer(HiddenStatesTransfer):
 
     def __init__(self, hidden_states_path: Path):
         self.hidden_states_path = hidden_states_path
+        self.profile_enabled = False
+        self._last_profile: dict[str, Any] = {}
+
+    def _load(self, path: Path) -> dict[str, torch.Tensor] | None:
+        if not self.profile_enabled:
+            return _load_hs_file(path)
+        profile: dict[str, Any] = {}
+        try:
+            return _load_hs_file(path, profile)
+        finally:
+            self._last_profile = profile
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        return _load_hs_file(path)
+        return self._load(path)
 
     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
-        return _load_hs_file(Path(handle))
+        return self._load(Path(handle))
+
+    def consume_profile(self) -> dict[str, Any]:
+        profile = self._last_profile
+        self._last_profile = {}
+        return profile
+
+    def set_profile_enabled(self, enabled: bool) -> None:
+        if self.profile_enabled == enabled:
+            return
+        self.profile_enabled = enabled
+        if not enabled:
+            self._last_profile = {}
 
     def cache(self, handle: str, file_idx: int) -> None:
         self.hidden_states_path.mkdir(parents=True, exist_ok=True)

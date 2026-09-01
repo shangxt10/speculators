@@ -81,6 +81,7 @@ def create_train_val_loaders(
     num_workers: int,
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
+    profile_pipeline: bool = False,
     train_data_ratio: float = 0.9,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
@@ -127,6 +128,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            profile_pipeline=profile_pipeline,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -140,6 +142,9 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            # The detailed profile is emitted only from train_epoch. Avoid
+            # collecting unused transfer and collate timings during validation.
+            profile_pipeline=False,
         )
 
     train_loader = _setup_dataloader(
