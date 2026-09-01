@@ -841,13 +841,18 @@ def parse_args():
     parser.add_argument(
         "--vllm-endpoint",
         type=str,
-        default="http://localhost:8000/v1",
+        action="extend",
+        nargs="+",
+        default=None,
         help=(
-            "vLLM endpoint address to use if generating hidden states on-demand."
+            "One or more vLLM endpoint addresses to use if generating hidden states "
+            "on-demand. Multiple endpoints are load-balanced round-robin across "
+            "training ranks and DataLoader workers. The option may be specified once "
+            "with multiple URLs or repeated."
             " Only required if `--on-missing=generate` and samples are missing."
-            " Note: the vLLM instance must be configured to cache hidden states"
-            " to a location that is accessible from the training instance. i.e."
-            " on the same node, or a shared network drive. (Default: 'http://localhost:8000/v1')"
+            " Note: every vLLM instance must write hidden states to a path accessible "
+            "from the training instance, such as the same node or a shared network "
+            "drive. (Default: 'http://localhost:8000/v1')"
         ),
     )
     parser.add_argument(
@@ -1297,6 +1302,9 @@ def parse_args():
     )
 
     args = parser.parse_args()
+
+    if args.vllm_endpoint is None:
+        args.vllm_endpoint = ["http://localhost:8000/v1"]
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:

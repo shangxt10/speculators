@@ -78,7 +78,11 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--hidden-states-path`** (str, default: `{data-path}/hidden_states`) Path where cached hidden states files are stored (or will be stored if generating).
 
-- **`--vllm-endpoint`** (str, default: `"http://localhost:8000/v1"`) vLLM endpoint address for generating hidden states on-demand (online training). Ignored if `--on-missing` is not set to `generate`.
+- **`--vllm-endpoint`** (one or more strings, default: `"http://localhost:8000/v1"`) vLLM endpoint addresses for generating hidden states on-demand (online training). Pass multiple URLs after one option, or repeat the option. Requests are distributed round-robin with rank/worker-specific starting offsets. Every service's returned hidden-states path must be accessible from the training machine. Ignored if `--on-missing` is not set to `generate`.
+
+  ```bash
+  --vllm-endpoint http://10.0.0.11:8000/v1 http://10.0.0.12:8000/v1
+  ```
 
 - **`--request-timeout`** (float, default: `180.0`) Timeout in seconds for each individual vLLM request.
 

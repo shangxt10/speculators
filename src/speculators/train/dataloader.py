@@ -70,7 +70,7 @@ def create_train_val_loaders(
     noise_std: float,
     legacy_data: bool,
     transfer: HiddenStatesTransfer | None = None,
-    vllm_endpoint: str,
+    vllm_endpoint: str | list[str],
     on_missing: Literal["generate", "skip", "warn", "raise"],
     on_generate: Literal["cache", "delete"],
     verifier_name_or_path: str,

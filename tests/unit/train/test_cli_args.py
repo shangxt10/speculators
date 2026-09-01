@@ -15,6 +15,42 @@ def _parse(monkeypatch, extra: list[str]):
     return parse_args()
 
 
+def test_vllm_endpoint_default(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.vllm_endpoint == ["http://localhost:8000/v1"]
+
+
+def test_vllm_endpoint_accepts_one_or_multiple_values(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--vllm-endpoint",
+            "http://host-a:8000/v1",
+            "http://host-b:8000/v1",
+        ],
+    )
+    assert args.vllm_endpoint == [
+        "http://host-a:8000/v1",
+        "http://host-b:8000/v1",
+    ]
+
+
+def test_vllm_endpoint_option_can_be_repeated(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--vllm-endpoint",
+            "http://host-a:8000/v1",
+            "--vllm-endpoint",
+            "http://host-b:8000/v1",
+        ],
+    )
+    assert args.vllm_endpoint == [
+        "http://host-a:8000/v1",
+        "http://host-b:8000/v1",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Ensure CLI args flow correctly through vars(args) into get_trainer_kwargs
 # ---------------------------------------------------------------------------
