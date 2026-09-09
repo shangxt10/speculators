@@ -47,7 +47,8 @@ def parse_args():
         description="Launch vLLM for hidden states extraction",
         usage=(
             "launch_vllm.py [-h] MODEL [--hidden-states-backend BACKEND] "
-            "[--target-layer-ids TARGET_LAYER_IDS [TARGET_LAYER_IDS ...]] -- *VLLM_ARGS"
+            "[--target-layer-ids TARGET_LAYER_IDS [TARGET_LAYER_IDS ...]] "
+            "[--trust-remote-code] -- *VLLM_ARGS"
         ),
     )
     parser.add_argument(
@@ -86,6 +87,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help=(
+            "Allow custom model code when reading the model config and when "
+            "launching vLLM. Only use this option with trusted model repositories."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the command that would be executed without running it",
@@ -98,9 +107,21 @@ def main():
     if "--" in vllm_args:
         vllm_args.remove("--")
 
+    trust_remote_code_arg = "--trust-remote-code"
+    # Accept the option both as a wrapper argument before ``--`` and as an
+    # existing vLLM passthrough argument after ``--``.
+    trust_remote_code = (
+        args.trust_remote_code or trust_remote_code_arg in vllm_args
+    )
+    if trust_remote_code and trust_remote_code_arg not in vllm_args:
+        vllm_args.append(trust_remote_code_arg)
+
     from transformers import AutoConfig  # noqa: PLC0415
 
-    config = AutoConfig.from_pretrained(args.model)
+    config = AutoConfig.from_pretrained(
+        args.model,
+        trust_remote_code=trust_remote_code,
+    )
     if hasattr(config, "text_config"):
         config = config.text_config
     num_hidden_layers = config.num_hidden_layers
