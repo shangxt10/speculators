@@ -108,6 +108,20 @@ def _maybe_apply_mrope_full_head_hack(
         )
 
 
+def _resolve_draft_head_dim(verifier_config: PretrainedConfig) -> int | None:
+    """Resolve the draft attention head width from the verifier config."""
+    head_dim = getattr(verifier_config, "head_dim", None)
+    if head_dim is not None:
+        return head_dim
+
+    qk_nope_head_dim = getattr(verifier_config, "qk_nope_head_dim", None)
+    qk_rope_head_dim = getattr(verifier_config, "qk_rope_head_dim", None)
+    if qk_nope_head_dim is not None and qk_rope_head_dim is not None:
+        return qk_nope_head_dim + qk_rope_head_dim
+
+    return None
+
+
 def create_transformer_layer_config(  # noqa: C901
     verifier_name_or_path: str,
     num_layers: int,
@@ -149,7 +163,7 @@ def create_transformer_layer_config(  # noqa: C901
             "nor 'hidden_activation'"
         )
 
-    head_dim = getattr(verifier_config, "head_dim", None)
+    head_dim = _resolve_draft_head_dim(verifier_config)
     num_attention_heads = verifier_config.num_attention_heads
     num_key_value_heads = verifier_config.num_key_value_heads
 

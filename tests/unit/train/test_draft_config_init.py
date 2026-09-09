@@ -24,6 +24,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from scripts.train import (
     DECODER_SHAPING_FLAGS,
     _build_from_config_only,
+    _resolve_draft_head_dim,
     build_draft_model,
     create_transformer_layer_config,
     load_draft_transformer_layer_config,
@@ -108,6 +109,40 @@ def _make_verifier_namespace(**overrides) -> SimpleNamespace:
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_resolve_draft_head_dim_prefers_explicit_value():
+    verifier = _make_verifier_namespace(
+        head_dim=96,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+
+    assert _resolve_draft_head_dim(verifier) == 96
+
+
+def test_resolve_draft_head_dim_combines_nope_and_rope_dimensions():
+    verifier = _make_verifier_namespace(
+        head_dim=None,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+
+    assert _resolve_draft_head_dim(verifier) == 192
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"head_dim": None},
+        {"head_dim": None, "qk_nope_head_dim": 128},
+        {"head_dim": None, "qk_rope_head_dim": 64},
+    ],
+)
+def test_resolve_draft_head_dim_requires_both_qk_dimensions(overrides):
+    verifier = _make_verifier_namespace(**overrides)
+
+    assert _resolve_draft_head_dim(verifier) is None
 
 
 # ---------------------------------------------------------------------------
