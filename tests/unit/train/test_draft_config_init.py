@@ -145,6 +145,24 @@ def test_resolve_draft_head_dim_requires_both_qk_dimensions(overrides):
     assert _resolve_draft_head_dim(verifier) is None
 
 
+def test_create_layer_config_forwards_trust_remote_code():
+    verifier = _make_verifier_namespace()
+    with patch(
+        "scripts.train.AutoConfig.from_pretrained", return_value=verifier
+    ) as load_config:
+        create_transformer_layer_config(
+            "target",
+            num_layers=2,
+            draft_arch="llama",
+            hidden_act=None,
+            sliding_window=2048,
+            full_attention_indices=[],
+            trust_remote_code=True,
+        )
+
+    load_config.assert_called_once_with("target", trust_remote_code=True)
+
+
 # ---------------------------------------------------------------------------
 # CLI validation: --draft-config exclusivity
 # ---------------------------------------------------------------------------

@@ -130,6 +130,7 @@ def create_transformer_layer_config(  # noqa: C901
     sliding_window: int,
     full_attention_indices: list[int],
     mrope_full_head_hack: bool = True,
+    trust_remote_code: bool = False,
 ) -> PretrainedConfig:
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
@@ -146,7 +147,10 @@ def create_transformer_layer_config(  # noqa: C901
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    verifier_config = AutoConfig.from_pretrained(
+        verifier_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(verifier_config, "text_config"):
@@ -351,7 +355,11 @@ def parse_vocab_mappings(args: argparse.Namespace):
         logger.info("No vocab mappings provided. Regenerating from token frequencies")
         token_freq_dict = torch.load(token_freq_path, weights_only=True)
 
-        target_vocab_size = get_target_vocab_size(None, args.verifier_name_or_path)
+        target_vocab_size = get_target_vocab_size(
+            None,
+            args.verifier_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+        )
 
         d2t, t2d = build_vocab_mappings_from_distribution(
             token_freq_dict=token_freq_dict,
@@ -378,10 +386,12 @@ def parse_vocab_mappings(args: argparse.Namespace):
         "None. Using full verifier vocab"
     )
     # When vocab mapping is not provided, use the full verifier vocab
-    verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
-    return None, None, verifier_config.vocab_size
+    verifier_vocab_size = get_target_vocab_size(
+        None,
+        args.verifier_name_or_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    return None, None, verifier_vocab_size
 
 
 def _build_from_config_only(
@@ -508,6 +518,7 @@ def build_draft_model(
                 sliding_window=args.sliding_window,
                 full_attention_indices=full_attention_indices,
                 mrope_full_head_hack=args.draft_mrope_full_head_hack,
+                trust_remote_code=args.trust_remote_code,
             )
 
         args.mask_token_id = resolve_mask_token_id(
@@ -790,7 +801,10 @@ def parse_args():
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
-        help="Allow executing code from HF Hub when loading the verifier's tokenizer.",
+        help=(
+            "Allow executing custom code when loading the verifier's configuration "
+            "and tokenizer."
+        ),
     )
     parser.add_argument(
         "--speculator-type",
