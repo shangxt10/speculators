@@ -131,6 +131,67 @@ def test_resolve_draft_head_dim_combines_nope_and_rope_dimensions():
     assert _resolve_draft_head_dim(verifier) == 192
 
 
+def test_resolve_draft_head_dim_ignores_runtime_only_head_dim():
+    verifier = _make_verifier_namespace(
+        head_dim=64,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    raw_config = {
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+    }
+
+    assert _resolve_draft_head_dim(verifier, raw_config) == 192
+
+
+def test_resolve_draft_head_dim_prefers_explicit_raw_value():
+    verifier = _make_verifier_namespace(
+        head_dim=64,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    raw_config = {
+        "head_dim": 96,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+    }
+
+    assert _resolve_draft_head_dim(verifier, raw_config) == 96
+
+
+def test_create_layer_config_uses_raw_qk_dimensions():
+    verifier = _make_verifier_namespace(
+        head_dim=64,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    raw_config = {
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+    }
+
+    with (
+        patch("scripts.train.AutoConfig.from_pretrained", return_value=verifier),
+        patch(
+            "scripts.train.PretrainedConfig.get_config_dict",
+            return_value=(raw_config, {}),
+        ) as load_raw_config,
+    ):
+        config = create_transformer_layer_config(
+            "target",
+            num_layers=2,
+            draft_arch="qwen3",
+            hidden_act=None,
+            sliding_window=2048,
+            full_attention_indices=[],
+            trust_remote_code=True,
+        )
+
+    assert config.head_dim == 192
+    load_raw_config.assert_called_once_with("target", trust_remote_code=True)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -108,14 +108,23 @@ def _maybe_apply_mrope_full_head_hack(
         )
 
 
-def _resolve_draft_head_dim(verifier_config: PretrainedConfig) -> int | None:
-    """Resolve the draft attention head width from the verifier config."""
-    head_dim = getattr(verifier_config, "head_dim", None)
+def _resolve_draft_head_dim(
+    verifier_config: PretrainedConfig,
+    raw_config: dict | None = None,
+) -> int | None:
+    """Resolve the draft head width, honoring only explicitly saved fields."""
+    if raw_config is not None:
+        head_dim = raw_config.get("head_dim")
+        qk_nope_head_dim = raw_config.get("qk_nope_head_dim")
+        qk_rope_head_dim = raw_config.get("qk_rope_head_dim")
+    else:
+        head_dim = getattr(verifier_config, "head_dim", None)
+        qk_nope_head_dim = getattr(verifier_config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(verifier_config, "qk_rope_head_dim", None)
+
     if head_dim is not None:
         return head_dim
 
-    qk_nope_head_dim = getattr(verifier_config, "qk_nope_head_dim", None)
-    qk_rope_head_dim = getattr(verifier_config, "qk_rope_head_dim", None)
     if qk_nope_head_dim is not None and qk_rope_head_dim is not None:
         return qk_nope_head_dim + qk_rope_head_dim
 
@@ -156,6 +165,19 @@ def create_transformer_layer_config(  # noqa: C901
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
+    raw_verifier_config = None
+    if (
+        getattr(verifier_config, "qk_nope_head_dim", None) is not None
+        and getattr(verifier_config, "qk_rope_head_dim", None) is not None
+    ):
+        raw_verifier_config, _ = PretrainedConfig.get_config_dict(
+            verifier_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
+        raw_text_config = raw_verifier_config.get("text_config")
+        if isinstance(raw_text_config, dict):
+            raw_verifier_config = raw_text_config
+
     hidden_act = (
         hidden_act
         or getattr(verifier_config, "hidden_act", None)
@@ -167,7 +189,7 @@ def create_transformer_layer_config(  # noqa: C901
             "nor 'hidden_activation'"
         )
 
-    head_dim = _resolve_draft_head_dim(verifier_config)
+    head_dim = _resolve_draft_head_dim(verifier_config, raw_verifier_config)
     num_attention_heads = verifier_config.num_attention_heads
     num_key_value_heads = verifier_config.num_key_value_heads
 
