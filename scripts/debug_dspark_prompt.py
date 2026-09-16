@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import openai
@@ -69,10 +70,29 @@ def _tokenize_prompt(processor, prompt: str) -> torch.Tensor:
         add_generation_prompt=True,
         return_tensors="pt",
     )
-    if isinstance(encoded, dict):
+    # Depending on the Transformers version and the custom processor,
+    # apply_chat_template may return a Tensor, a BatchEncoding/BatchFeature,
+    # a plain mapping, or a Python list. BatchEncoding is not guaranteed to
+    # inherit from dict, so checking only isinstance(encoded, dict) leaves the
+    # wrapper intact and makes the following `.ndim` access fail.
+    if isinstance(encoded, Mapping):
+        if "input_ids" not in encoded:
+            raise TypeError(
+                "apply_chat_template returned a mapping without input_ids: "
+                f"{list(encoded.keys())}"
+            )
         encoded = encoded["input_ids"]
+    elif hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    if not isinstance(encoded, torch.Tensor):
+        encoded = torch.as_tensor(encoded)
     if encoded.ndim == 2:
         encoded = encoded[0]
+    if encoded.ndim != 1:
+        raise ValueError(
+            "Expected one tokenized prompt with shape [T] or [1,T], "
+            f"got {list(encoded.shape)}"
+        )
     return encoded.long()
 
 
