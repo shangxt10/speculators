@@ -291,6 +291,8 @@ def create_transformer_layer_config(  # noqa: C901
 def load_draft_transformer_layer_config(
     draft_config: str,
     verifier_name_or_path: str,
+    *,
+    trust_remote_code: bool = False,
 ) -> PretrainedConfig:
     """Load the draft decoder ``transformer_layer_config`` from a config source.
 
@@ -320,7 +322,9 @@ def load_draft_transformer_layer_config(
     config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
     draft_config_obj = config_class.from_dict(config_dict)
 
-    verifier_config = get_verifier_config(verifier_name_or_path)
+    verifier_config = get_verifier_config(
+        verifier_name_or_path, trust_remote_code=trust_remote_code
+    )
     if draft_config_obj.hidden_size != verifier_config.hidden_size:
         raise ValueError(
             f"--draft-config hidden_size ({draft_config_obj.hidden_size}) must match "
@@ -515,11 +519,15 @@ def build_draft_model(
         # transformer_layer_config and extracts the native MTP head weights from
         # the verifier; the decoder-shaping flags and --draft-config do not apply,
         # and there is no draft mask token to resolve.
-        transformer_layer_config = get_verifier_config(args.verifier_name_or_path)
+        transformer_layer_config = get_verifier_config(
+            args.verifier_name_or_path, trust_remote_code=args.trust_remote_code
+        )
     else:
         if args.draft_config:
             transformer_layer_config = load_draft_transformer_layer_config(
-                args.draft_config, args.verifier_name_or_path
+                args.draft_config,
+                args.verifier_name_or_path,
+                trust_remote_code=args.trust_remote_code,
             )
         else:
             full_attention_indices = args.full_attention_indices

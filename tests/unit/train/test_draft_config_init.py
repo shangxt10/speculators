@@ -430,7 +430,9 @@ def test_mtp_with_from_pretrained_parses(monkeypatch):
 def _patch_verifier(monkeypatch, hidden_size: int, vocab_size: int):
     monkeypatch.setattr(
         "scripts.train.get_verifier_config",
-        lambda _path: SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size),
+        lambda _path, **_kwargs: SimpleNamespace(
+            hidden_size=hidden_size, vocab_size=vocab_size
+        ),
     )
 
 
@@ -446,6 +448,42 @@ def test_load_draft_config_from_dir(tmp_path, monkeypatch):
     assert out.num_hidden_layers == 3
     # vocab_size is aligned to the verifier's target vocabulary
     assert out.vocab_size == 200
+
+
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_build_draft_config_forwards_verifier_trust(tmp_path, trust_remote_code):
+    Qwen3Config(hidden_size=64, vocab_size=100).save_pretrained(tmp_path)
+    verifier = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=64, vocab_size=200)
+    )
+    args = SimpleNamespace(
+        speculator_type="dflash",
+        from_pretrained="",
+        draft_config=str(tmp_path),
+        verifier_name_or_path="custom-verifier",
+        trust_remote_code=trust_remote_code,
+        mask_token_id=0,
+    )
+
+    class _FakeModel:
+        @classmethod
+        def from_training_args(cls, *, verifier_config, **_kwargs):
+            return verifier_config
+
+    with (
+        patch(
+            "speculators.models.utils.AutoConfig.from_pretrained",
+            return_value=verifier,
+        ) as load_config,
+        patch("scripts.train.resolve_mask_token_id", return_value=0),
+    ):
+        config = build_draft_model(args, _FakeModel, None, None, 100)
+
+    load_config.assert_called_once_with(
+        "custom-verifier", trust_remote_code=trust_remote_code
+    )
+    assert config.hidden_size == 64
+    assert config.vocab_size == 200
 
 
 def test_load_draft_config_hidden_size_mismatch_raises(tmp_path, monkeypatch):
@@ -582,11 +620,18 @@ def test_build_from_config_only_reapplies_draft_attn_impl(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(monkeypatch):
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(
+    monkeypatch, trust_remote_code
+):
     """MTP without --from-pretrained reuses the verifier's own decoder config and
     must not synthesize a decoder or resolve a draft mask token."""
     verifier_cfg = object()
-    monkeypatch.setattr("scripts.train.get_verifier_config", lambda _p: verifier_cfg)
+    def _load_verifier(_path, *, trust_remote_code):
+        captured["trust_remote_code"] = trust_remote_code
+        return verifier_cfg
+
+    monkeypatch.setattr("scripts.train.get_verifier_config", _load_verifier)
 
     def _must_not_call(*_a, **_k):
         raise AssertionError("not expected for MTP-from-scratch")
@@ -611,12 +656,14 @@ def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(monkeypatch):
         mask_token_id=None,
         num_speculative_steps=3,
         draft_mrope_full_head_hack=True,
+        trust_remote_code=trust_remote_code,
     )
 
     built = build_draft_model(args, _FakeMTP, None, None, None)  # type: ignore[arg-type]
 
     assert built == "MTP_MODEL"
     assert captured["verifier_config"] is verifier_cfg
+    assert captured["trust_remote_code"] is trust_remote_code
     assert captured["num_speculative_steps"] == 3
     # mask token stays unset for MTP (resolve_mask_token_id was never called)
     assert args.mask_token_id is None
