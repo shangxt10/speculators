@@ -21,11 +21,34 @@ Two verifier expert layouts are supported:
 - Transformers must provide `DistributedConfig`, `ep_router`, `grouped_gemm`,
   and `moe_tp_experts`.
 - `accelerate>=1.1.0` must be installed because Transformers places replicated
-  and sharded weights on the rank-local NPU while loading.
+  and sharded weights with a low-memory CPU staging load.
 - The verifier config must define `base_model_ep_plan`.
 - The EP size must evenly divide the routed-expert count.
 - Greedy decoding (`--temperature 0`) is required so every rank enters the same
   model collectives in the same order.
+
+TreeSpark-style offline tree proposals are available through
+`--tree-top-k 4 --tree-max-nodes 32`. The default `--tree-top-k 1` keeps the
+existing linear DSpark proposal. See
+[`docs/TREE_SPECULATIVE_OFFLINE_EVAL.md`](../docs/TREE_SPECULATIVE_OFFLINE_EVAL.md)
+for the algorithm, checkpoint constraints, and metric definitions.
+
+Install the repository and the ModuleList loading dependency into the same
+Python environment used by `torchrun`:
+
+```bash
+python3 -m pip install 'accelerate>=1.1.0'
+python3 -m pip install -e . --no-deps
+python3 -c 'import accelerate; print(accelerate.__version__)'
+```
+
+For a ModuleList checkpoint, each rank temporarily stages the complete bf16
+verifier in CPU memory, removes experts owned by other ranks, and then transfers
+only the retained model to its NPU. A 29B checkpoint therefore needs roughly
+60 GiB of temporary host memory per simultaneously loading rank. When launching
+several independent EP jobs on one node, wait until one job logs
+`Loaded pure EP verifier` before starting the next job; the evaluations may run
+concurrently after model loading finishes.
 
 On Ascend, target-context and draft-noise projections may carry different
 physical formats (NCHW versus NCL). The EP evaluator replaces only the in-memory
@@ -50,7 +73,7 @@ accepted only when exactly one element matches `[B, S, H]`.
 Check the local model config without loading weights:
 
 ```bash
-python3 scripts/evaluate/ep_eval/inspect_ep_support.py \
+python3 xingchen4_eval_ep/inspect_ep_support.py \
   --model /hpfs/model/xingchen4 \
   --expert-parallel-size 4 \
   --trust-remote-code \
@@ -68,7 +91,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 torchrun \
   --standalone \
   --nproc-per-node=4 \
-  scripts/evaluate/ep_eval/evaluate_ep.py \
+  xingchen4_eval_ep/evaluate_ep.py \
   --verifier-model /hpfs/nlp/yangzhihao/ckpts/TeleChat4-29B/29b_12.05T_wodsa_id20_s3_256k_8_260903_1000_final_hf \
   --draft-model /hpfs/huawei-2607/shangxt/Telecom-29B/telecom_80w_no_thinking_0910_16_16/checkpoints/checkpoint_best \
   --datasets-root /hpfs/huawei-2607/shangxt/evaldata \

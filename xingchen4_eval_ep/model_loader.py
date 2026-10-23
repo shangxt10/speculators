@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,18 @@ from parallel_state import ExpertParallelContext
 
 LOGGER = logging.getLogger("dspark_pytorch_ep_eval")
 MODULE_HOOK_EP_STYLES = frozenset({"ep_router", "moe_tp_experts"})
+
+
+def _require_accelerate_for_low_cpu_load() -> None:
+    """Fail before loading a large ModuleList checkpoint without Accelerate."""
+    try:
+        import accelerate  # noqa: F401, PLC0415
+    except ImportError as error:
+        raise RuntimeError(
+            "Low-memory ModuleList expert-parallel loading requires accelerate. "
+            "Install it into the same Python environment as "
+            f"torchrun with: {sys.executable} -m pip install 'accelerate>=1.1.0'"
+        ) from error
 
 
 def _resolve_dtype(name: str):
@@ -178,13 +192,20 @@ def load_expert_parallel_target(
     context.barrier()
 
     if expert_layout == "modulelist":
+        _require_accelerate_for_low_cpu_load()
+        if context.is_primary:
+            LOGGER.info(
+                "Staging the full ModuleList verifier on CPU before pruning to "
+                "rank-local experts; this avoids materializing the full 29B model "
+                "on every NPU"
+            )
         model = AutoModelForCausalLM.from_pretrained(
             str(model_path),
             config=config,
             dtype=_resolve_dtype(dtype),
             trust_remote_code=trust_remote_code,
             local_files_only=local_files_only,
-            device_map={"": context.device},
+            low_cpu_mem_usage=True,
         ).eval()
         patched_blocks = install_modulelist_expert_parallel(
             model,
@@ -193,6 +214,19 @@ def load_expert_parallel_target(
             ep_size=context.world_size,
             process_group=context.device_mesh.get_group(),
         )
+        # Only the replicated layers and this rank's expert slice are moved to
+        # the NPU. The previous implementation used device_map here and filled
+        # each NPU with the complete verifier before expert pruning.
+        model = model.to(context.device).eval()
+        gc.collect()
+        torch_module = sys.modules.get("torch")
+        empty_cache = getattr(
+            getattr(torch_module, "npu", None),
+            "empty_cache",
+            None,
+        )
+        if callable(empty_cache):
+            empty_cache()
         model._dspark_ep_implementation = "custom_modulelist"
         if context.is_primary:
             LOGGER.info(
@@ -534,7 +568,7 @@ class _HiddenStreamCollapserProbe:
                 if "head" in item[0].lower()
                 or "head" in type(item[1]).__name__.lower()
                 else 1,
-                item[0].count("."),
+                -item[0].count("."),
             )
         )
         return candidates[0]

@@ -14,6 +14,8 @@ from types import ModuleType
 
 
 MODULE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = MODULE_DIR.parent
+OFFLINE_EVALUATOR_PATH = REPO_ROOT / "scripts" / "evaluate" / "dspark_offline_eval.py"
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
@@ -33,7 +35,12 @@ LOGGER = logging.getLogger("dspark_pytorch_ep_eval")
 
 
 def _load_legacy_evaluator() -> ModuleType:
-    path = MODULE_DIR.parent / "dspark_offline_eval.py"
+    path = OFFLINE_EVALUATOR_PATH
+    if not path.is_file():
+        raise FileNotFoundError(
+            "DSpark offline evaluator is missing. Expected the migrated evaluator "
+            f"at {path}"
+        )
     spec = importlib.util.spec_from_file_location(
         "dspark_offline_eval_readonly_for_ep",
         path,
@@ -136,6 +143,10 @@ def _prepare_legacy_args(
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.tree_top_k < 1:
+        raise ValueError("--tree-top-k must be >= 1")
+    if args.tree_max_nodes < 1:
+        raise ValueError("--tree-max-nodes must be >= 1")
     if args.temperature != 0:
         raise ValueError(
             "Pure EP evaluation currently requires --temperature 0 so every "
@@ -208,6 +219,13 @@ def run(args: argparse.Namespace) -> None:
             tokenizer,
             args,
         )
+        if context.is_primary:
+            LOGGER.info(
+                "DSpark proposal mode: %s (tree_top_k=%d, tree_max_nodes=%d)",
+                "tree" if runner.tree_enabled else "chain",
+                runner.tree_top_k,
+                runner.tree_max_nodes,
+            )
         base_runner = (
             legacy.BaseModelOfflineRunner(target_model, tokenizer, args)
             if args.measure_base_speedup
@@ -267,6 +285,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--tree-top-k",
+        type=int,
+        default=1,
+        help="Per-parent branching factor; values >=2 enable TreeSpark mode.",
+    )
+    parser.add_argument(
+        "--tree-max-nodes",
+        type=int,
+        default=32,
+        help="Maximum non-root tree nodes in each target verification.",
+    )
     parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument(
         "--enable-thinking",
