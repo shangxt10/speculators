@@ -8,6 +8,7 @@ from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.moe import DSparkMoE
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
 
@@ -33,6 +34,9 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config=config)
 
         hidden_size = config.transformer_layer_config.hidden_size
+        if config.draft_moe is not None:
+            for layer in self.layers:
+                layer.mlp = DSparkMoE(hidden_size, config.draft_moe)
 
         self.markov_head: MarkovHead | None = None
         if config.markov_rank > 0:
@@ -70,6 +74,7 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            draft_moe=kwargs.get("draft_moe"),
             enable_confidence_head=(
                 True
                 if enable_confidence_head_arg is None

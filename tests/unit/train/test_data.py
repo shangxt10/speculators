@@ -2,7 +2,9 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 from datasets import Dataset
 from safetensors.torch import save_file
@@ -490,6 +492,115 @@ def test_arrow_dataset_default_split_ratio_does_not_crash(tmp_path: Path):
     # Should not raise AttributeError
     assert arrow_ds._map_to_file_idx(0) == 0
     assert arrow_ds._map_to_file_idx(5) == 5
+
+
+def test_arrow_dataset_round_robins_vllm_endpoints_across_workers(
+    tmp_path: Path, monkeypatch
+):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.save_to_disk(str(tmp_path / "data"))
+
+    arrow_ds = ArrowDataset(
+        max_len=128,
+        datapath=str(tmp_path / "data"),
+        vllm_endpoint=[
+            "http://host-a:8000/v1",
+            "http://host-b:8000/v1",
+            "http://host-c:8000/v1",
+        ],
+        on_missing="skip",
+    )
+
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setattr(
+        "speculators.train.data.get_worker_info",
+        lambda: SimpleNamespace(id=1, num_workers=2),
+    )
+
+    # rank=1, num_workers=2, worker=1 gives slot 3, so this worker starts at
+    # endpoint 0 and then independently cycles through every endpoint.
+    selected = [arrow_ds._next_vllm_endpoint_index() for _ in range(6)]
+    assert selected == [0, 1, 2, 0, 1, 2]
+
+
+def test_arrow_dataset_rejects_empty_vllm_endpoint_list(tmp_path: Path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.save_to_disk(str(tmp_path / "data"))
+
+    with pytest.raises(ValueError, match="at least one non-empty URL"):
+        ArrowDataset(
+            max_len=128,
+            datapath=str(tmp_path / "data"),
+            vllm_endpoint=[],
+            on_missing="skip",
+        )
+
+
+def test_arrow_dataset_uses_each_client_returned_hidden_states_path(monkeypatch):
+    class FakeTransfer:
+        def __init__(self):
+            self.loaded_handles = []
+            self.deleted_handles = []
+
+        def get_generated(self, handle):
+            self.loaded_handles.append(handle)
+            return {
+                "token_ids": torch.tensor([1, 2, 3]),
+                "hidden_states": torch.zeros(3, 2, 4),
+            }
+
+        def delete(self, handle):
+            self.deleted_handles.append(handle)
+
+    arrow_ds = ArrowDataset.__new__(ArrowDataset)
+    arrow_ds.vllm_endpoints = (
+        "http://host-a:8000/v1",
+        "http://host-b:8000/v1",
+    )
+    client_a, client_b = object(), object()
+    arrow_ds.clients = [client_a, client_b]
+    arrow_ds._endpoint_models = ["model", "model"]
+    arrow_ds._vllm_request_count = 0
+    arrow_ds.data = [{"input_ids": torch.tensor([1, 2, 3])}]
+    arrow_ds.transfer = FakeTransfer()
+    arrow_ds.start_file_idx = 0
+    arrow_ds.on_generate = "delete"
+    arrow_ds.request_timeout = 120
+    arrow_ds.max_retries = 0
+
+    handles_by_client = {
+        client_a: "/service-a/hidden_states/a.safetensors",
+        client_b: "/service-b/hidden_states/b.safetensors",
+    }
+
+    def fake_generate(client, model, client_item, **kwargs):
+        assert model == "model"
+        assert client_item["input_ids"] == [1, 2, 3]
+        return handles_by_client[client]
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr("speculators.train.data.get_worker_info", lambda: None)
+    monkeypatch.setattr(
+        "speculators.train.data.generate_hidden_states", fake_generate
+    )
+    monkeypatch.setattr("speculators.train.data.check_hidden_states", lambda *_: None)
+
+    assert arrow_ds._maybe_generate_hs(0) is not None
+    assert arrow_ds._maybe_generate_hs(0) is not None
+    assert arrow_ds.transfer.loaded_handles == list(handles_by_client.values())
+    assert arrow_ds.transfer.deleted_handles == list(handles_by_client.values())
 
 
 def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Path):

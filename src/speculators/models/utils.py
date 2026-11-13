@@ -13,8 +13,12 @@ def conditional_torch_compile(func=None, *args, **kwargs):
     return func
 
 
-def get_verifier_config(verifier_name_or_path: str) -> PretrainedConfig:
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+def get_verifier_config(
+    verifier_name_or_path: str, *, trust_remote_code: bool = False
+) -> PretrainedConfig:
+    verifier_config = AutoConfig.from_pretrained(
+        verifier_name_or_path, trust_remote_code=trust_remote_code
+    )
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
     return verifier_config

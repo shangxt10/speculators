@@ -1,0 +1,89 @@
+{
+  "status": "PASS",
+  "validation_date": "2026-11-11",
+  "tested_commit": "d88124e172340ae9158ad8c37c345bde29f451ab",
+  "base_repository": "https://github.com/shangxt10/speculators",
+  "base_branch": "dspark_telecom",
+  "base_commit": "110bd4af297380865f7a1d765c9f0429a65bcb0f",
+  "execution": {
+    "entrypoint": "scripts/train.py",
+    "devices": "16 Ascend NPUs",
+    "parallelism": "FSDP, DP=16, SP=1",
+    "checkpoint_steps": [
+      50,
+      100
+    ],
+    "separate_process_resume_at": 50,
+    "independent_environment": true,
+    "customer_checkout_import_audit": "PASS"
+  },
+  "environment": {
+    "torch": "2.12.0+cpu",
+    "torch_npu": "2.12.0rc1",
+    "transformers": "5.13.1"
+  },
+  "fixture": {
+    "unique_train_samples": 16,
+    "unique_validation_samples": 16,
+    "repeated_training_rows": 800,
+    "sequence_length": 256,
+    "hidden_size": 4096,
+    "vocab_size": 129280,
+    "num_hidden_layers": 3,
+    "block_size": 7,
+    "num_anchors": 8,
+    "attention_backend": "eager",
+    "teacher_contract": "Frozen local DSV4 vocabulary tables in an HF metadata container; native RMSNorm applied to cached final hidden states. Not identical teacher logits to the original DSV4 benchmark.",
+    "draft_moe": {
+      "num_experts": 64,
+      "experts_per_token": 4,
+      "expert_intermediate_size": 1024,
+      "num_shared_experts": 1,
+      "score_function": "softmax",
+      "normalize_topk": true,
+      "routed_scaling_factor": 1.0
+    }
+  },
+  "scope": "Functional training/save/resume validation on repeated real-HS samples; not a quality, acceptance-length, throughput or customer-checkpoint result.",
+  "logged_metrics": {
+    "step_count": 100,
+    "all_finite": true,
+    "first_train_loss": 39.564,
+    "last_train_loss": 3.432,
+    "first_10_mean_train_loss": 25.3733,
+    "last_10_mean_train_loss": 3.7164,
+    "first_resumed_lr_rounded": 5.33e-05
+  },
+  "checkpoint_checks": [
+    {
+      "global_step": 50,
+      "saved_lr": 5.327015646150716e-05,
+      "scheduler_step": 50,
+      "optimizer_steps": [
+        50
+      ],
+      "feature_moment_l1": 182.54122161865234,
+      "finite_model_tensors": 48,
+      "source_receipt_sha256": "56a9350294ee968ea49c2008a6cc7aed374aa06d439a56b0c3e46457d02e02ae",
+      "logged_steps": [
+        0,
+        49
+      ]
+    },
+    {
+      "global_step": 100,
+      "saved_lr": 0.0,
+      "scheduler_step": 100,
+      "optimizer_steps": [
+        100
+      ],
+      "feature_moment_l1": 343.4066467285156,
+      "finite_model_tensors": 48,
+      "source_receipt_sha256": "c04a8de1b449a6a129d966f69c86c4add9beb9f433d1420e7c019eacabb9fb77",
+      "logged_steps": [
+        50,
+        99
+      ]
+    }
+  ]
+}
