@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import logging
 import random
 import warnings
@@ -108,6 +109,29 @@ def _maybe_apply_mrope_full_head_hack(
         )
 
 
+def _resolve_draft_head_dim(
+    verifier_config: PretrainedConfig,
+    raw_config: dict | None = None,
+) -> int | None:
+    """Resolve the draft head width, honoring only explicitly saved fields."""
+    if raw_config is not None:
+        head_dim = raw_config.get("head_dim")
+        qk_nope_head_dim = raw_config.get("qk_nope_head_dim")
+        qk_rope_head_dim = raw_config.get("qk_rope_head_dim")
+    else:
+        head_dim = getattr(verifier_config, "head_dim", None)
+        qk_nope_head_dim = getattr(verifier_config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(verifier_config, "qk_rope_head_dim", None)
+
+    if head_dim is not None:
+        return head_dim
+
+    if qk_nope_head_dim is not None and qk_rope_head_dim is not None:
+        return qk_nope_head_dim + qk_rope_head_dim
+
+    return None
+
+
 def create_transformer_layer_config(  # noqa: C901
     verifier_name_or_path: str,
     num_layers: int,
@@ -116,6 +140,7 @@ def create_transformer_layer_config(  # noqa: C901
     sliding_window: int,
     full_attention_indices: list[int],
     mrope_full_head_hack: bool = True,
+    trust_remote_code: bool = False,
 ) -> PretrainedConfig:
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
@@ -132,11 +157,27 @@ def create_transformer_layer_config(  # noqa: C901
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    verifier_config = AutoConfig.from_pretrained(
+        verifier_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
+
+    raw_verifier_config = None
+    if (
+        getattr(verifier_config, "qk_nope_head_dim", None) is not None
+        and getattr(verifier_config, "qk_rope_head_dim", None) is not None
+    ):
+        raw_verifier_config, _ = PretrainedConfig.get_config_dict(
+            verifier_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
+        raw_text_config = raw_verifier_config.get("text_config")
+        if isinstance(raw_text_config, dict):
+            raw_verifier_config = raw_text_config
 
     hidden_act = (
         hidden_act
@@ -149,7 +190,7 @@ def create_transformer_layer_config(  # noqa: C901
             "nor 'hidden_activation'"
         )
 
-    head_dim = getattr(verifier_config, "head_dim", None)
+    head_dim = _resolve_draft_head_dim(verifier_config, raw_verifier_config)
     num_attention_heads = verifier_config.num_attention_heads
     num_key_value_heads = verifier_config.num_key_value_heads
 
@@ -251,6 +292,8 @@ def create_transformer_layer_config(  # noqa: C901
 def load_draft_transformer_layer_config(
     draft_config: str,
     verifier_name_or_path: str,
+    *,
+    trust_remote_code: bool = False,
 ) -> PretrainedConfig:
     """Load the draft decoder ``transformer_layer_config`` from a config source.
 
@@ -280,7 +323,9 @@ def load_draft_transformer_layer_config(
     config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
     draft_config_obj = config_class.from_dict(config_dict)
 
-    verifier_config = get_verifier_config(verifier_name_or_path)
+    verifier_config = get_verifier_config(
+        verifier_name_or_path, trust_remote_code=trust_remote_code
+    )
     if draft_config_obj.hidden_size != verifier_config.hidden_size:
         raise ValueError(
             f"--draft-config hidden_size ({draft_config_obj.hidden_size}) must match "
@@ -337,7 +382,11 @@ def parse_vocab_mappings(args: argparse.Namespace):
         logger.info("No vocab mappings provided. Regenerating from token frequencies")
         token_freq_dict = torch.load(token_freq_path, weights_only=True)
 
-        target_vocab_size = get_target_vocab_size(None, args.verifier_name_or_path)
+        target_vocab_size = get_target_vocab_size(
+            None,
+            args.verifier_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+        )
 
         d2t, t2d = build_vocab_mappings_from_distribution(
             token_freq_dict=token_freq_dict,
@@ -364,10 +413,12 @@ def parse_vocab_mappings(args: argparse.Namespace):
         "None. Using full verifier vocab"
     )
     # When vocab mapping is not provided, use the full verifier vocab
-    verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
-    return None, None, verifier_config.vocab_size
+    verifier_vocab_size = get_target_vocab_size(
+        None,
+        args.verifier_name_or_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    return None, None, verifier_vocab_size
 
 
 def _build_from_config_only(
@@ -469,11 +520,15 @@ def build_draft_model(
         # transformer_layer_config and extracts the native MTP head weights from
         # the verifier; the decoder-shaping flags and --draft-config do not apply,
         # and there is no draft mask token to resolve.
-        transformer_layer_config = get_verifier_config(args.verifier_name_or_path)
+        transformer_layer_config = get_verifier_config(
+            args.verifier_name_or_path, trust_remote_code=args.trust_remote_code
+        )
     else:
         if args.draft_config:
             transformer_layer_config = load_draft_transformer_layer_config(
-                args.draft_config, args.verifier_name_or_path
+                args.draft_config,
+                args.verifier_name_or_path,
+                trust_remote_code=args.trust_remote_code,
             )
         else:
             full_attention_indices = args.full_attention_indices
@@ -494,6 +549,7 @@ def build_draft_model(
                 sliding_window=args.sliding_window,
                 full_attention_indices=full_attention_indices,
                 mrope_full_head_hack=args.draft_mrope_full_head_hack,
+                trust_remote_code=args.trust_remote_code,
             )
 
         args.mask_token_id = resolve_mask_token_id(
@@ -770,13 +826,26 @@ def validate_draft_init_args(
         )
 
 
+def validate_intermediate_supervision_args(parser, args):
+    if args.intermediate_supervision is not None and (
+        args.speculator_type != "dspark" or args.from_pretrained
+    ):
+        parser.error(
+            "--intermediate-supervision requires a new DSpark model; "
+            "--from-pretrained uses its saved recipe."
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
-        help="Allow executing code from HF Hub when loading the verifier's tokenizer.",
+        help=(
+            "Allow executing custom code when loading the verifier's configuration "
+            "and tokenizer."
+        ),
     )
     parser.add_argument(
         "--speculator-type",
@@ -841,13 +910,18 @@ def parse_args():
     parser.add_argument(
         "--vllm-endpoint",
         type=str,
-        default="http://localhost:8000/v1",
+        action="extend",
+        nargs="+",
+        default=None,
         help=(
-            "vLLM endpoint address to use if generating hidden states on-demand."
+            "One or more vLLM endpoint addresses to use if generating hidden states "
+            "on-demand. Multiple endpoints are load-balanced round-robin across "
+            "training ranks and DataLoader workers. The option may be specified once "
+            "with multiple URLs or repeated."
             " Only required if `--on-missing=generate` and samples are missing."
-            " Note: the vLLM instance must be configured to cache hidden states"
-            " to a location that is accessible from the training instance. i.e."
-            " on the same node, or a shared network drive. (Default: 'http://localhost:8000/v1')"
+            " Note: every vLLM instance must write hidden states to a path accessible "
+            "from the training instance, such as the same node or a shared network "
+            "drive. (Default: 'http://localhost:8000/v1')"
         ),
     )
     parser.add_argument(
@@ -990,6 +1064,12 @@ def parse_args():
     parser.add_argument("--d2t-path", type=str, default=None)
     parser.add_argument("--t2d-path", type=str, default=None)
     parser.add_argument("--mask-token-id", type=int, default=None)
+    parser.add_argument(
+        "--intermediate-supervision",
+        type=json.loads,
+        default=None,
+        help="DSpark training-only auxiliary-head recipe as a JSON object.",
+    )
     parser.add_argument("--ttt-steps", type=int, default=3)
     parser.add_argument(
         "--num-speculative-steps",
@@ -1297,6 +1377,10 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    validate_intermediate_supervision_args(parser, args)
+
+    if args.vllm_endpoint is None:
+        args.vllm_endpoint = ["http://localhost:8000/v1"]
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:

@@ -471,6 +471,9 @@ class Trainer:
                 for k, v in batch.items()
             }
 
+            set_train_step = getattr(self.model, "set_train_step", None)
+            if callable(set_train_step):
+                set_train_step(self.global_step)
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):

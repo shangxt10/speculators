@@ -3,7 +3,7 @@ import math
 import os
 import random
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -11,7 +11,7 @@ from typing import Any, Literal, cast
 import openai
 import torch
 from datasets import load_from_disk
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
 from speculators.data_generation.offline import check_hidden_states
@@ -205,7 +205,7 @@ class ArrowDataset(BaseDataset):
         max_len: int,
         datapath: str | PathLike,
         transfer: HiddenStatesTransfer | None = None,
-        vllm_endpoint: str = "http://localhost:8000/v1",
+        vllm_endpoint: str | Sequence[str] = "http://localhost:8000/v1",
         on_missing: Literal["generate", "skip", "warn", "raise"] = "generate",
         on_generate: Literal["cache", "delete"] = "delete",
         split_ratio: float = 1.0,
@@ -231,10 +231,21 @@ class ArrowDataset(BaseDataset):
             raise ValueError("split_ratio must be in range (-1.0, 1.0] excluding 0.0.")
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
-        self.vllm_endpoint = vllm_endpoint
+        if isinstance(vllm_endpoint, str):
+            endpoints = (vllm_endpoint.strip(),)
+        else:
+            endpoints = tuple(endpoint.strip() for endpoint in vllm_endpoint)
+        if not endpoints or any(not endpoint for endpoint in endpoints):
+            raise ValueError("vllm_endpoint must contain at least one non-empty URL")
+        self.vllm_endpoints = endpoints
+        # Retain the original attribute for callers that inspect a single endpoint.
+        self.vllm_endpoint = endpoints[0]
         self.on_missing = on_missing
         self.on_generate = on_generate
-        self.client: openai.OpenAI | None = None
+        self.clients: list[openai.OpenAI | None] = [None] * len(endpoints)
+        self._endpoint_models: list[str | None] = [None] * len(endpoints)
+        self._vllm_request_count = 0
+        self._transfer_is_setup = False
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
@@ -245,20 +256,75 @@ class ArrowDataset(BaseDataset):
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
 
-    def _setup_client(self):
-        self.client = openai.OpenAI(
-            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
-        )
-        list_models = self.client.models.list()
+    @property
+    def client(self) -> openai.OpenAI | None:
+        """Backward-compatible alias for the first endpoint's client."""
+        return self.clients[0]
+
+    @client.setter
+    def client(self, value: openai.OpenAI | None) -> None:
+        self.clients[0] = value
+
+    def _next_vllm_endpoint_index(self) -> int:
+        """Select the next endpoint, staggered across ranks and workers.
+
+        DataLoader workers are separate processes, so a shared global counter would
+        require cross-process synchronization on every sample. Instead, every worker
+        independently round-robins all endpoints and starts at a rank/worker-specific
+        offset. This keeps distribution even without adding a hot shared lock.
+        """
+        worker_info = get_worker_info()
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+        except ValueError:
+            rank = 0
+
+        if worker_info is None:
+            worker_slot = rank
+        else:
+            worker_slot = rank * worker_info.num_workers + worker_info.id
+
+        endpoint_index = (
+            worker_slot + self._vllm_request_count
+        ) % len(self.vllm_endpoints)
+        self._vllm_request_count += 1
+        return endpoint_index
+
+    def _setup_client(self, endpoint_index: int = 0) -> None:
+        endpoint = self.vllm_endpoints[endpoint_index]
+        client = openai.OpenAI(base_url=endpoint, api_key="EMPTY", max_retries=0)
+        list_models = client.models.list()
         model_id = list_models.data[0].id
         if self.model and self.model != model_id:
             raise ValueError(
                 f"An explicit model name was passed ({self.model}) which doesn't match"
-                f" found model_id {model_id}."
-                "Please make sure --endpoint is set to the correct vllm instance."
+                f" found model_id {model_id} at endpoint {endpoint}."
+                " Please make sure --vllm-endpoint is set to the correct vLLM instance."
             )
         self.model = model_id
-        self.transfer.setup()
+        self.clients[endpoint_index] = client
+        self._endpoint_models[endpoint_index] = model_id
+        if not self._transfer_is_setup:
+            self.transfer.setup()
+            self._transfer_is_setup = True
+
+    def _get_client_for_request(self) -> tuple[openai.OpenAI, str, str]:
+        endpoint_index = self._next_vllm_endpoint_index()
+        if self.clients[endpoint_index] is None:
+            self._setup_client(endpoint_index)
+
+        client = self.clients[endpoint_index]
+        model = self._endpoint_models[endpoint_index]
+        if client is not None and model is None and self.model is not None:
+            # Preserve support for tests/callers that inject a preconfigured client.
+            model = self.model
+            self._endpoint_models[endpoint_index] = model
+        if client is None or model is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError(
+                f"Failed to initialize vLLM endpoint "
+                f"{self.vllm_endpoints[endpoint_index]}"
+            )
+        return client, model, self.vllm_endpoints[endpoint_index]
 
     def __len__(self):
         return len(self.data)
@@ -268,16 +334,15 @@ class ArrowDataset(BaseDataset):
         return list(self.data.with_format(None)["seq_len"])
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
-        if not self.client:
-            self._setup_client()
+        client, model, endpoint = self._get_client_for_request()
 
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
 
         try:
             handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
+                client,
+                model,
                 client_item,
                 timeout=self.request_timeout,
                 max_retries=self.max_retries,
@@ -299,7 +364,8 @@ class ArrowDataset(BaseDataset):
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
             warnings.warn(
-                f"Failed to load/cache hidden states for sample {index}: {e}",
+                f"Failed to load/cache hidden states for sample {index} via "
+                f"vLLM endpoint {endpoint}: {e}",
                 stacklevel=1,
             )
             return None

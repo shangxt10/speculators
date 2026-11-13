@@ -326,6 +326,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        intermediate_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
@@ -400,6 +401,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+
+            if intermediate_states is not None and layer_idx < len(self.layers) - 1:
+                intermediate_states.append(noise_embedding)
 
         hidden = self.norm(noise_embedding)
         logits = self.lm_head(hidden)

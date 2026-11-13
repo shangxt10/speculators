@@ -1,11 +1,13 @@
 from typing import ClassVar
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
+from speculators.models.dspark.intermediate import IntermediateHead, auxiliary_loss
 from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
@@ -55,6 +57,33 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             self.confidence_head = ConfidenceHead(input_dim)
 
+        self._train_step = 0
+        self.intermediate_heads = None
+        settings = config.intermediate_supervision
+        if settings is not None:
+            if len(self.layers) <= 1:
+                raise ValueError(
+                    "Intermediate supervision needs at least two draft layers"
+                )
+            self.intermediate_heads = nn.ModuleList(
+                IntermediateHead(
+                    hidden_size,
+                    settings.rank,
+                    self.draft_vocab_size,
+                    config.transformer_layer_config.rms_norm_eps,
+                )
+                for _ in range(len(self.layers) - 1)
+            )
+
+    def set_train_step(self, step: int) -> None:
+        """The trainer supplies its checkpointed optimizer-step counter."""
+        self._train_step = step
+
+    def remove_intermediate_supervision(self) -> None:
+        """Strip training-only heads before exporting an inference checkpoint."""
+        self.intermediate_heads = None
+        self.config.intermediate_supervision = None
+
     @classmethod
     def from_training_args(
         cls,
@@ -70,6 +99,7 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            intermediate_supervision=kwargs.get("intermediate_supervision"),
             enable_confidence_head=(
                 True
                 if enable_confidence_head_arg is None
@@ -125,6 +155,16 @@ class DSparkDraftModel(DFlashDraftModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
+        intermediate_states = (
+            [] if self.training and self.intermediate_heads is not None else None
+        )
+        if (
+            intermediate_states is not None
+            and per_position_loss_weight != "fixed-exp-decay"
+        ):
+            raise ValueError(
+                "Intermediate supervision currently requires fixed-exp-decay"
+            )
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
             self._backbone_forward(
                 hidden_states,
@@ -133,6 +173,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 verifier_last_hidden_states,
                 document_ids,
                 position_ids,
+                intermediate_states=intermediate_states,
                 max_anchors=max_anchors,
                 **kwargs,
             )
@@ -197,4 +238,23 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
+        if intermediate_states is not None:
+            settings = self.config.intermediate_supervision
+            auxiliary, inter_metrics = auxiliary_loss(
+                self.intermediate_heads,
+                intermediate_states,
+                targets,
+                aligned_loss_mask,
+                self.block_size,
+                gamma,
+                settings,
+                self.config.sample_from_anchor,
+            )
+            weight = settings.weight_at(self._train_step)
+            metrics.update(inter_metrics)
+            metrics["inter_aux_loss_sum"] = auxiliary.detach()
+            metrics["inter_aux_loss_total"] = auxiliary.new_ones(())
+            metrics["inter_aux_weight_sum"] = auxiliary.new_tensor(weight)
+            metrics["inter_aux_weight_total"] = auxiliary.new_ones(())
+            loss = loss + weight * auxiliary
         return None, loss, metrics
