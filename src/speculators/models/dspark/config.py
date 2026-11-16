@@ -4,6 +4,7 @@ from pydantic import Field
 
 from speculators import SpeculatorModelConfig
 from speculators.models.dflash.config import DFlashSpeculatorConfig
+from speculators.models.dspark.intermediate import IntermediateSupervisionConfig
 
 __all__ = [
     "DSparkSpeculatorConfig",
@@ -20,6 +21,10 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     """
 
     speculators_model_type: Literal["dspark"] = "dspark"  # type: ignore[assignment]
+    intermediate_supervision: IntermediateSupervisionConfig | None = Field(
+        default=None,
+        description="Training-only intermediate heads; disabled by default.",
+    )
     architectures: list[str] = Field(
         default_factory=lambda: ["DSparkSpeculator"],
         description="Model architectures that can load these weights",

@@ -100,6 +100,13 @@ class BaseCheckpointer:
         loaded_list = loaded if isinstance(loaded, list) else [loaded]
         for sched, state_dict in zip(schedulers, loaded_list, strict=True):
             sched.load_state_dict(state_dict)
+            # Constructing an LR scheduler performs an initial step and can
+            # overwrite the LR restored with the optimizer. load_state_dict
+            # restores scheduler counters, but does not update optimizer groups.
+            for group, lr in zip(
+                sched.optimizer.param_groups, sched.get_last_lr(), strict=True
+            ):
+                group["lr"] = lr
 
     @_rank0_only
     def save_scheduler_state_dict(self, scheduler: SchedulerOrList, epoch: int | str):
