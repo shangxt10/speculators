@@ -14,6 +14,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Unpack
 
+from speculators.models.mla import Qwen3MLAAttention, layer_uses_mla
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -159,7 +161,12 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
+        attention_class = (
+            Qwen3MLAAttention
+            if layer_uses_mla(config, layer_idx)
+            else Qwen3DFlashAttention
+        )
+        self.self_attn = attention_class(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # type: ignore[arg-type]
         self.post_attention_layernorm = Qwen3RMSNorm(

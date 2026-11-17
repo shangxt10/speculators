@@ -9,6 +9,7 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import SpeculatorModel
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.metrics import LossConfig, resolve_loss_config
+from speculators.models.mla import configure_mla
 from speculators.models.peagle.attention import create_peagle_mask_mod
 from speculators.models.peagle.config import PEagleSpeculatorConfig
 from speculators.models.peagle.data import generate_cod_sample_indices
@@ -234,6 +235,7 @@ class PEagleDraftModel(Eagle3DraftModel):
             kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
 
+        configure_mla(verifier_config, **kwargs)
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"
         )

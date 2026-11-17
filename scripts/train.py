@@ -20,6 +20,7 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
 )
 from speculators.model import SpeculatorModel
+from speculators.models.draft_config import transformer_config_from_dict
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.eagle3.rotary_partial import install_partial_neox_rotary
 from speculators.models.metrics import resolve_loss_config
@@ -319,8 +320,7 @@ def load_draft_transformer_layer_config(
             "eagle3/peagle, 'qwen3' for dflash); none was found in the config "
             f"loaded from '{draft_config}'."
         )
-    config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
-    draft_config_obj = config_class.from_dict(config_dict)
+    draft_config_obj = transformer_config_from_dict(config_dict)
 
     verifier_config = get_verifier_config(
         verifier_name_or_path, trust_remote_code=trust_remote_code
@@ -767,6 +767,12 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
     "draft_hidden_act": "--draft-hidden-act",
     "sliding_window": "--sliding-window",
     "full_attention_indices": "--full-attention-indices",
+    "draft_use_mla": "--draft-use-mla",
+    "mla_kv_lora_rank": "--mla-kv-lora-rank",
+    "mla_q_lora_rank": "--mla-q-lora-rank",
+    "mla_qk_nope_head_dim": "--mla-qk-nope-head-dim",
+    "mla_qk_rope_head_dim": "--mla-qk-rope-head-dim",
+    "mla_v_head_dim": "--mla-v-head-dim",
 }
 
 
@@ -825,8 +831,74 @@ def validate_draft_init_args(
         )
 
 
+def validate_mla_args(parser: argparse.ArgumentParser, args: argparse.Namespace):
+    """Fail before loading verifier weights for invalid opt-in MLA options."""
+    dimensions = {
+        name: getattr(args, name)
+        for name in DECODER_SHAPING_FLAGS
+        if name.startswith("mla_")
+    }
+    if not args.draft_use_mla:
+        if any(value is not None for value in dimensions.values()):
+            parser.error("--mla-* dimensions require --draft-use-mla")
+        return
+    if args.draft_arch != "qwen3" or args.speculator_type not in (
+        "dflash",
+        "dspark",
+        "eagle3",
+        "peagle",
+    ):
+        parser.error(
+            "--draft-use-mla requires a qwen3 dflash/dspark/eagle3/peagle draft"
+        )
+    if any(value is not None and value <= 0 for value in dimensions.values()):
+        parser.error("--mla-* dimensions must be positive integers")
+    if args.mla_qk_rope_head_dim is not None and args.mla_qk_rope_head_dim % 2:
+        parser.error("--mla-qk-rope-head-dim must be even")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--draft-use-mla",
+        "--use-mla",
+        action="store_true",
+        help="Enable MLA for Qwen3 draft attention (default: original attention). "
+        "Saved in transformer_layer_config.use_mla. For --draft-config or "
+        "--from-pretrained, set MLA fields in the saved config instead.",
+    )
+    parser.add_argument(
+        "--mla-kv-lora-rank",
+        type=int,
+        default=None,
+        help="Shared KV latent rank (default: min(512, hidden_size // 4)).",
+    )
+    parser.add_argument(
+        "--mla-q-lora-rank",
+        type=int,
+        default=None,
+        help="Optional query latent rank (default: direct query projection).",
+    )
+    parser.add_argument(
+        "--mla-qk-nope-head-dim",
+        type=int,
+        default=None,
+        help="Per-head content Q/K width "
+        "(default: head_dim minus the default RoPE width).",
+    )
+    parser.add_argument(
+        "--mla-qk-rope-head-dim",
+        type=int,
+        default=None,
+        help="Even decoupled RoPE width "
+        "(default: half head_dim, rounded down to even).",
+    )
+    parser.add_argument(
+        "--mla-v-head-dim",
+        type=int,
+        default=None,
+        help="Per-head value width (default: head_dim).",
+    )
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
     parser.add_argument(
         "--trust-remote-code",
@@ -1376,6 +1448,7 @@ def parse_args():
 
     provided = explicitly_provided_dests(parser, DECODER_SHAPING_FLAGS)
     validate_draft_init_args(parser, args, provided)
+    validate_mla_args(parser, args)
     resolve_loss_config(args.loss_fn)
 
     if args.per_position_loss_weight == "dpace":

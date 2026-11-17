@@ -51,11 +51,10 @@ def install_draft_kv_projection_nd_hooks(
     return len(handles)
 
 
-def _empty_nd_like_sequence(left: Any, total_length: int) -> Any:
-    """Allocate [batch, total_length, hidden] in an explicit base ND format."""
+def _empty_nd(left: Any, shape: tuple[int, ...]) -> Any:
+    """Allocate an attention buffer in an explicit base ND format."""
     import torch
 
-    shape = (left.shape[0], total_length, left.shape[2])
     if left.device.type != "npu":
         return torch.empty(shape, dtype=left.dtype, device=left.device)
 
@@ -86,9 +85,25 @@ def _sequence_concat_without_cat(left: Any, right: Any) -> Any:
         )
 
     left_length = left.shape[1]
-    output = _empty_nd_like_sequence(left, left_length + right.shape[1])
+    output = _empty_nd(
+        left, (left.shape[0], left_length + right.shape[1], left.shape[2])
+    )
     output.narrow(1, 0, left_length).copy_(left)
     output.narrow(1, left_length, right.shape[1]).copy_(right)
+    return output
+
+
+def _mla_concat_without_cat(tensors: Any, dim: int = 0) -> Any:
+    """Copy MLA context, RoPE halves and head components into ND buffers."""
+    left = tensors[0]
+    dim %= left.ndim
+    shape = list(left.shape)
+    shape[dim] = sum(tensor.shape[dim] for tensor in tensors)
+    output = _empty_nd(left, tuple(shape))
+    offset = 0
+    for tensor in tensors:
+        output.narrow(dim, offset, tensor.shape[dim]).copy_(tensor)
+        offset += tensor.shape[dim]
     return output
 
 
@@ -173,21 +188,29 @@ def _npu_safe_dflash_attention_forward(
 
 
 def install_draft_attention_cat_compatibility(draft_model: Any) -> int:
-    """Patch only DFlash attention instances; installed package files stay intact."""
+    """Support GQA/MLA draft layers without replacing MLA with a GQA forward."""
     existing = getattr(draft_model, "_dspark_npu_attention_patch_count", None)
     if existing is not None:
         return existing
 
     patched = 0
     for _module_name, module in draft_model.named_modules():
-        if type(module).__name__ != "Qwen3DFlashAttention":
+        if type(module).__name__ == "Qwen3MLAAttention":
+            if not hasattr(module, "concat_tensors"):
+                raise RuntimeError(
+                    "MLA NPU evaluation requires updated speculators code"
+                )
+            module.concat_tensors = _mla_concat_without_cat
+        elif type(module).__name__ == "Qwen3DFlashAttention":
+            module.forward = MethodType(_npu_safe_dflash_attention_forward, module)
+        else:
             continue
-        module.forward = MethodType(_npu_safe_dflash_attention_forward, module)
         patched += 1
 
     if patched == 0:
         raise RuntimeError(
-            "Could not find Qwen3DFlashAttention modules for NPU-safe K/V "
+            "Could not find Qwen3DFlashAttention/Qwen3MLAAttention modules "
+            "for NPU-safe "
             "concatenation."
         )
 

@@ -93,38 +93,13 @@ def _load_draft(
     args: argparse.Namespace,
     context: ExpertParallelContext,
 ):
-    from speculators.models.dspark.core import DSparkDraftModel
-
-    config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
-    config.transformer_layer_config._attn_implementation = args.draft_attn_impl
-
-    verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
-    if verifier is not None:
-        verifier.name_or_path = str(args.verifier_model)
-
-    sample_from_anchor = legacy._parse_bool_override(args.sample_from_anchor)
-    if sample_from_anchor is not None:
-        config.sample_from_anchor = sample_from_anchor
-
-    d2t, t2d = legacy._load_vocab_mapping_tensors(
-        draft_model_path=args.draft_model,
-        d2t_path=args.d2t_path,
-        t2d_path=args.t2d_path,
-    )
-    model = DSparkDraftModel.from_pretrained(
-        args.draft_model,
-        config=config,
-        d2t=d2t,
-        t2d=t2d,
-    )
-    model = model.to(context.device).eval()
+    model = legacy.load_dspark_draft(args, context.device)
     patch_count = install_draft_attention_cat_compatibility(model)
     if context.is_primary:
         LOGGER.info(
             "Installed NPU-safe K/V concatenation on %d draft attention layers",
             patch_count,
         )
-    legacy._ensure_loaded_vocab_mappings(model, args)
     return model
 
 

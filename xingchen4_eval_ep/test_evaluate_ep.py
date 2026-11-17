@@ -19,6 +19,7 @@ class OfflineEvaluatorDependencyTests(unittest.TestCase):
         evaluator = evaluate_ep._load_legacy_evaluator()
 
         required_names = (
+            "load_dspark_draft",
             "_parse_bool_override",
             "_load_vocab_mapping_tensors",
             "_ensure_loaded_vocab_mappings",

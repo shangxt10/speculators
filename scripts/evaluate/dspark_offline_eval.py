@@ -2334,6 +2334,65 @@ def _parse_bool_override(value: str | None) -> bool | None:
     raise ValueError(f"Expected boolean value, got {value}")
 
 
+def load_dspark_draft(args: argparse.Namespace, device=None):
+    """Restore saved GQA/MLA structure consistently for standalone and EP eval."""
+    import torch as torch_module  # noqa: PLC0415
+
+    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
+    from speculators.models.mla import (  # noqa: PLC0415
+        Qwen3MLAAttention,
+        layer_uses_mla,
+    )
+
+    device = device if device is not None else args.device
+    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    # Training paths may not exist on the evaluation host. Use this run's target.
+    draft_config.speculators_config.verifier.name_or_path = str(args.verifier_model)
+    sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
+    if sample_from_anchor is not None:
+        draft_config.sample_from_anchor = sample_from_anchor
+    draft_attn_impl = _resolve_draft_attn_impl(str(device), args.draft_attn_impl)
+    if draft_attn_impl is not None:
+        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
+    d2t, t2d = _load_vocab_mapping_tensors(
+        draft_model_path=args.draft_model,
+        d2t_path=args.d2t_path,
+        t2d_path=args.t2d_path,
+    )
+    dtype = getattr(torch_module, args.dtype) if args.dtype != "auto" else "auto"
+    draft_model = DSparkDraftModel.from_pretrained(
+        args.draft_model,
+        config=draft_config,
+        d2t=d2t,
+        t2d=t2d,
+        torch_dtype=dtype,
+    ).to(device).eval()
+    _ensure_loaded_vocab_mappings(draft_model, args)
+    layer_config = draft_config.transformer_layer_config
+    for index, layer in enumerate(draft_model.layers):
+        attention = layer.self_attn
+        is_mla = isinstance(attention, Qwen3MLAAttention)
+        if is_mla != layer_uses_mla(layer_config, index):
+            raise RuntimeError(f"Draft layer {index} does not match saved MLA config")
+        logger.info(
+            "Draft layer %d: %s backend=%s dtype=%s%s",
+            index,
+            type(attention).__name__,
+            layer_config._attn_implementation,
+            next(attention.parameters()).dtype,
+            (
+                f" kv_rank={attention.kv_lora_rank} nope_dim={attention.nope_dim}"
+                f" rope_dim={attention.rope_dim} v_dim={attention.v_head_dim}"
+                if is_mla else ""
+            ),
+        )
+    logger.info(
+        "DSpark implementation: %s",
+        sys.modules[DSparkDraftModel.__module__].__file__,
+    )
+    return draft_model
+
+
 def run(args: argparse.Namespace) -> None:
     global torch, DynamicCache
     if int(args.tree_top_k) < 1:
@@ -2352,8 +2411,6 @@ def run(args: argparse.Namespace) -> None:
     import torch as torch_module  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
     from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
-
-    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
 
     torch = torch_module
     DynamicCache = DynamicCacheClass
@@ -2375,26 +2432,8 @@ def run(args: argparse.Namespace) -> None:
         .eval()
     )
 
-    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
-    sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
-    if sample_from_anchor is not None:
-        draft_config.sample_from_anchor = sample_from_anchor
-    draft_attn_impl = _resolve_draft_attn_impl(args.device, args.draft_attn_impl)
-    if draft_attn_impl is not None:
-        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
-    d2t, t2d = _load_vocab_mapping_tensors(
-        draft_model_path=args.draft_model,
-        d2t_path=args.d2t_path,
-        t2d_path=args.t2d_path,
-    )
-    draft_model = DSparkDraftModel.from_pretrained(
-        args.draft_model,
-        config=draft_config,
-        d2t=d2t,
-        t2d=t2d,
-    )
-    draft_model = draft_model.to(device).eval()
-    _ensure_loaded_vocab_mappings(draft_model, args)
+    draft_model = load_dspark_draft(args, device)
+    draft_config = draft_model.config
     if getattr(draft_model, "correction_head", None) is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
@@ -2424,10 +2463,6 @@ def run(args: argparse.Namespace) -> None:
         bool(getattr(draft_config, "correction_lm_head_fusion", False)),
         bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
         bool(getattr(draft_config, "dflash2_candidate_selector", False)),
-    )
-    logger.info(
-        "DSpark implementation: %s",
-        sys.modules[DSparkDraftModel.__module__].__file__,
     )
 
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)

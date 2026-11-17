@@ -1,10 +1,11 @@
 from typing import Any, Literal
 
 from pydantic import Field, field_serializer, field_validator, model_validator
-from transformers import AutoConfig, PretrainedConfig
+from transformers import PretrainedConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from speculators import SpeculatorModelConfig
+from speculators.models.draft_config import transformer_config_from_dict
 
 __all__ = [
     "Eagle3SpeculatorConfig",
@@ -105,12 +106,7 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
     def validate_transformer_config(cls, value: Any) -> PretrainedConfig:
         """Validate and convert transformer config."""
         if isinstance(value, dict):
-            config_class: type[PretrainedConfig] = Qwen3Config
-            if "model_type" in value:
-                config_class = AutoConfig.for_model(
-                    model_type=value["model_type"]
-                ).__class__
-            return config_class(**value)
+            return transformer_config_from_dict(value)
         return value
 
     @property

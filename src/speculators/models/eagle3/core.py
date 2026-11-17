@@ -17,6 +17,13 @@ from speculators.models.eagle3.attention import (
 from speculators.models.eagle3.metrics import compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.models.metrics import LossConfig, resolve_loss_config
+from speculators.models.mla import (
+    Qwen3MLAAttention,
+    all_layers_use_mla,
+    configure_mla,
+    layer_uses_mla,
+    mla_rotary_config,
+)
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
@@ -58,6 +65,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         self._init_vocab(config)
 
         tl_config = self.config.transformer_layer_config
+        configure_mla(tl_config)
         self._model_definitions = model_classes[tl_config.model_type]
 
         # Eagle3-specific: embed_tokens grad depends on config
@@ -87,6 +95,13 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         layers.extend(  # remaining layers
             [dl_class(tl_config, layer_idx) for layer_idx in range(1, num_layers)]
         )
+        for layer_idx, layer in enumerate(layers):
+            if layer_uses_mla(tl_config, layer_idx):
+                layer.self_attn = Qwen3MLAAttention(
+                    tl_config,
+                    layer_idx,
+                    input_size=tl_config.hidden_size * (2 if layer_idx == 0 else 1),
+                )
         self.layers = torch.nn.ModuleList(layers)
 
         # Sliding window attention support
@@ -104,6 +119,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         # Create a modified config for the rotary embedding to use 2x the hidden size
         modified_tl_config = copy.copy(config.transformer_layer_config)
         modified_tl_config.hidden_size *= 2
+        if all_layers_use_mla(tl_config):
+            modified_tl_config = mla_rotary_config(tl_config)
         self.rotary_emb = self._model_definitions.rotary_emb_class(modified_tl_config)
 
         # LAYER NORMS
@@ -387,6 +404,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
 
+        configure_mla(verifier_config, **kwargs)
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"
         )

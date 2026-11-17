@@ -10,6 +10,7 @@ nav:
                 - Dflash: user_guide/algorithms/dflash.md
                 - P-Eagle: user_guide/algorithms/peagle.md
                 - MTP: user_guide/algorithms/mtp.md
+                - Qwen3 MLA: user_guide/algorithms/qwen3_mla.md
                 - Decision Guide: user_guide/algorithms/decision_guide.md
           - Tutorials:
                 - user_guide/tutorials/index.md

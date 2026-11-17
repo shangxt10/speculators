@@ -12,6 +12,15 @@ target 树验证接入 `scripts/evaluate/dspark_offline_eval.py`。它只修改�
 `--tree-top-k >= 2` 才启用树投机。普通 DSpark checkpoint 可以直接用于树推理，
 但没有经过 TreeSpark 树目标训练时，候选排序和接受长度可能低于树训练模型。
 
+## MLA draft
+
+树投机同样支持 `layer_types` 包含 `"mla"` 的 DSpark checkpoint，以及普通层和
+MLA 的混合配置。普通离线入口与 Ascend EP 入口自动恢复训练时的结构，无需额外
+MLA 开关。`--draft-attn-impl sdpa` 选择计算后端，不会覆盖 checkpoint 的层类型。
+
+启动示例、实际 attention 类型日志及执行范围见
+[Qwen3 MLA 离线评测](user_guide/algorithms/qwen3_mla.md#dspark-离线推理测评含树投机)。
+
 ## TreeSpark 到 Speculators 的映射
 
 TreeSpark 的一次树投机轮次由四步组成：

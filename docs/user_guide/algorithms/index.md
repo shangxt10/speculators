@@ -22,6 +22,8 @@ Finetunes the model's native multi-token prediction head on domain-specific data
 
 All algorithms can be paired with any supported verifier model. For help choosing between them, see the [Decision Guide](decision_guide.md).
 
+For optional MLA attention in Qwen3 draft models, see [Qwen3 Draft MLA](qwen3_mla.md).
+
 ## Adding New Algorithms
 
 See the [Developer Guide](../../developer/add_algorithm.md) for instructions on adding custom algorithms to Speculators.
